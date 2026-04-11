@@ -8,18 +8,26 @@ final class EditorViewModel: ObservableObject {
     @Published var selectedAspectPreset: AspectPreset = .free
     @Published var resizeWidth: String = ""
     @Published var resizeHeight: String = ""
+    @Published var autoSizeToCrop = true
     @Published var fileName: String = ""
     @Published var errorMessage: String?
     @Published var infoMessage: String?
     @Published var isSaving = false
     @Published var isRenderingPreview = false
+    @Published var isRunningShellAction = false
+    @Published var lastShellCommandOutput: String = ""
+    @Published var customCommandTemplate: String = ""
+    @Published var needsPersistentFolderAccess = false
+    @Published var pendingAccessFolderName = ""
 
     private let launchImagePath: String?
     private var loadedImage: LoadedImage?
     private var previewGeneration = 0
+    private var pendingImageURLForAccess: URL?
 
     init(imagePath: String?) {
         launchImagePath = imagePath
+        _ = PermissionAccessManager.shared
     }
 
     var hasLoadedImage: Bool {
@@ -41,27 +49,54 @@ final class EditorViewModel: ObservableObject {
     func updateCropRect(_ rect: CGRect) {
         let constrained = constrainedCropRect(from: rect, ratio: selectedAspectPreset.ratio)
         cropRectNormalized = constrained
-        schedulePreviewRender()
+
+        if autoSizeToCrop {
+            applyResizeToCurrentCrop()
+        } else {
+            schedulePreviewRender()
+        }
     }
 
     func setAspectPreset(_ preset: AspectPreset) {
         selectedAspectPreset = preset
         cropRectNormalized = constrainedCropRect(from: cropRectNormalized, ratio: preset.ratio)
-        schedulePreviewRender()
+
+        if autoSizeToCrop {
+            applyResizeToCurrentCrop()
+        } else {
+            schedulePreviewRender()
+        }
     }
 
     func updateResizeWidth(_ value: String) {
+        autoSizeToCrop = false
         resizeWidth = value.filter(\.isNumber)
         schedulePreviewRender()
     }
 
     func updateResizeHeight(_ value: String) {
+        autoSizeToCrop = false
         resizeHeight = value.filter(\.isNumber)
         schedulePreviewRender()
     }
 
+    func setAutoSizeToCrop(_ enabled: Bool) {
+        autoSizeToCrop = enabled
+
+        if enabled {
+            applyResizeToCurrentCrop()
+        }
+    }
+
     func normalizeResizeFields() {
         guard let loadedImage else {
+            return
+        }
+
+        if autoSizeToCrop {
+            let cropSize = cropPixelSize(from: loadedImage.cgImage)
+            resizeWidth = String(Int(cropSize.width))
+            resizeHeight = String(Int(cropSize.height))
             return
         }
 
@@ -77,7 +112,12 @@ final class EditorViewModel: ObservableObject {
 
     func resetCrop() {
         cropRectNormalized = CGRect(x: 0.05, y: 0.05, width: 0.9, height: 0.9)
-        schedulePreviewRender()
+
+        if autoSizeToCrop {
+            applyResizeToCurrentCrop()
+        } else {
+            schedulePreviewRender()
+        }
     }
 
     func doneAndSave() {
@@ -126,16 +166,146 @@ final class EditorViewModel: ObservableObject {
         }
     }
 
+    func runShellAction(_ action: ShellImageAction) {
+        guard let loadedImage else {
+            return
+        }
+
+        guard !isRunningShellAction, !isSaving else {
+            return
+        }
+
+        isRunningShellAction = true
+        errorMessage = nil
+        infoMessage = "Running \(action.commandName)..."
+
+        let currentInputURL = loadedImage.url
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ShellActionRunner.run(action: action, inputURL: currentInputURL)
+
+            DispatchQueue.main.async {
+                self.isRunningShellAction = false
+                self.lastShellCommandOutput = [result.stdout, result.stderr]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+
+                if result.exitCode != 0 {
+                    let stderrSummary = result.stderr
+                        .split(separator: "\n")
+                        .suffix(2)
+                        .joined(separator: " ")
+                    self.errorMessage = stderrSummary.isEmpty
+                        ? "\(action.commandName) failed with exit code \(result.exitCode)."
+                        : stderrSummary
+                    return
+                }
+
+                if let outputURL = result.outputImageURL {
+                    self.loadImage(at: outputURL)
+                    self.infoMessage = "\(action.commandName) completed. Loaded \(outputURL.lastPathComponent)."
+                } else {
+                    self.infoMessage = "\(action.commandName) completed. No single output image detected to reload."
+                }
+            }
+        }
+    }
+
+    func runCustomShellCommand() {
+        guard let loadedImage else {
+            return
+        }
+
+        let template = customCommandTemplate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !template.isEmpty else {
+            errorMessage = "Enter a custom command first. Example: luma {input}"
+            return
+        }
+
+        guard !isRunningShellAction, !isSaving else {
+            return
+        }
+
+        isRunningShellAction = true
+        errorMessage = nil
+        infoMessage = "Running custom command..."
+
+        let currentInputURL = loadedImage.url
+        let firstToken = template.split(separator: " ").first?.lowercased() ?? ""
+        let expectsSingleImage = firstToken != "slice" && firstToken != "pslice"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ShellActionRunner.run(
+                customCommandTemplate: template,
+                inputURL: currentInputURL,
+                expectsSingleImageOutput: expectsSingleImage
+            )
+
+            DispatchQueue.main.async {
+                self.isRunningShellAction = false
+                self.lastShellCommandOutput = [result.stdout, result.stderr]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+
+                if result.exitCode != 0 {
+                    let stderrSummary = result.stderr
+                        .split(separator: "\n")
+                        .suffix(2)
+                        .joined(separator: " ")
+                    self.errorMessage = stderrSummary.isEmpty
+                        ? "Custom command failed with exit code \(result.exitCode)."
+                        : stderrSummary
+                    return
+                }
+
+                if let outputURL = result.outputImageURL {
+                    self.loadImage(at: outputURL)
+                    self.infoMessage = "Custom command completed. Loaded \(outputURL.lastPathComponent)."
+                } else {
+                    self.infoMessage = "Custom command completed. No single output image detected to reload."
+                }
+            }
+        }
+    }
+
+    func grantPersistentFolderAccess() {
+        guard let pendingURL = pendingImageURLForAccess else {
+            return
+        }
+
+        if let grantedFolder = PermissionAccessManager.shared.requestFolderAccess(startingAt: pendingURL.deletingLastPathComponent()) {
+            needsPersistentFolderAccess = false
+            pendingAccessFolderName = ""
+            errorMessage = nil
+            infoMessage = "Access granted to \(grantedFolder.lastPathComponent)."
+            loadImage(at: pendingURL)
+        } else {
+            errorMessage = "Folder access not granted. You can try again."
+        }
+    }
+
     private func loadFromLaunchPath() {
         guard let launchImagePath, !launchImagePath.isEmpty else {
             errorMessage = "No image path was received. Launch this app from Finder Quick Action: Edit Image."
             return
         }
 
+        let url = Self.normalizePathArgument(launchImagePath)
+        loadImage(at: url)
+    }
+
+    private func loadImage(at url: URL) {
+        if !PermissionAccessManager.shared.canAccess(url) {
+            pendingImageURLForAccess = url
+            pendingAccessFolderName = url.deletingLastPathComponent().lastPathComponent
+            needsPersistentFolderAccess = true
+            isRenderingPreview = false
+            errorMessage = "Access required for folder: \(pendingAccessFolderName)."
+            return
+        }
+
         errorMessage = nil
         isRenderingPreview = true
-
-        let url = Self.normalizePathArgument(launchImagePath)
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -149,15 +319,27 @@ final class EditorViewModel: ObservableObject {
                     self.loadedImage = loaded
                     self.fileName = loaded.url.lastPathComponent
                     self.sourceImage = image
-                    self.resizeWidth = String(loaded.cgImage.width)
-                    self.resizeHeight = String(loaded.cgImage.height)
                     self.cropRectNormalized = CGRect(x: 0.05, y: 0.05, width: 0.9, height: 0.9)
+                    self.autoSizeToCrop = true
+                    self.needsPersistentFolderAccess = false
+                    self.pendingImageURLForAccess = nil
+                    self.pendingAccessFolderName = ""
                     self.isRenderingPreview = false
-                    self.schedulePreviewRender()
+                    self.applyResizeToCurrentCrop()
                 }
             } catch {
                 DispatchQueue.main.async {
                     self.isRenderingPreview = false
+                    if let pipelineError = error as? PipelineError {
+                        switch pipelineError {
+                        case .permissionDenied:
+                            self.pendingImageURLForAccess = url
+                            self.pendingAccessFolderName = url.deletingLastPathComponent().lastPathComponent
+                            self.needsPersistentFolderAccess = true
+                        default:
+                            break
+                        }
+                    }
                     self.errorMessage = error.localizedDescription
                 }
             }
@@ -221,8 +403,30 @@ final class EditorViewModel: ObservableObject {
     }
 
     private func resolvedOutputSize(fallback: CGImage) -> CGSize {
+        if autoSizeToCrop {
+            return cropPixelSize(from: fallback)
+        }
+
         let width = max(1, Int(resizeWidth) ?? fallback.width)
         let height = max(1, Int(resizeHeight) ?? fallback.height)
+        return CGSize(width: width, height: height)
+    }
+
+    private func applyResizeToCurrentCrop() {
+        guard let loadedImage else {
+            return
+        }
+
+        let cropSize = cropPixelSize(from: loadedImage.cgImage)
+        resizeWidth = String(Int(cropSize.width))
+        resizeHeight = String(Int(cropSize.height))
+        schedulePreviewRender()
+    }
+
+    private func cropPixelSize(from image: CGImage) -> CGSize {
+        let normalized = ImagePipeline.clampNormalizedRect(cropRectNormalized)
+        let width = max(1, Int((normalized.width * CGFloat(image.width)).rounded()))
+        let height = max(1, Int((normalized.height * CGFloat(image.height)).rounded()))
         return CGSize(width: width, height: height)
     }
 

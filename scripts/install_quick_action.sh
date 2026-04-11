@@ -144,7 +144,16 @@ if [[ -z "$input_file" ]]; then
     exit 0
 fi
 
-/usr/bin/open -a "$app_path" --args "$input_file"</string>
+/usr/bin/open -na "$app_path" --args "$input_file"
+
+/usr/bin/osascript \
+    -e 'repeat 30 times' \
+    -e 'try' \
+    -e 'tell application id "com.zxcropper.app" to activate' \
+    -e 'end try' \
+    -e 'delay 0.08' \
+    -e 'end repeat' \
+    >/dev/null || true</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
                     <key>inputMethod</key>

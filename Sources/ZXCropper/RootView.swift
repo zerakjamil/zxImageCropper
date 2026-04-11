@@ -4,11 +4,11 @@ struct RootView: View {
     @ObservedObject var viewModel: EditorViewModel
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 10) {
             header
 
             if let sourceImage = viewModel.sourceImage {
-                HStack(spacing: 16) {
+                HStack(spacing: 12) {
                     CropCanvasView(
                         image: sourceImage,
                         cropRectNormalized: Binding(
@@ -17,10 +17,10 @@ struct RootView: View {
                         ),
                         aspectRatio: viewModel.selectedAspectPreset.ratio
                     )
-                    .frame(minWidth: 600, minHeight: 420)
+                    .frame(minWidth: 560, minHeight: 360)
 
                     sidebar
-                        .frame(width: 290)
+                        .frame(width: 275)
                 }
             } else {
                 placeholder
@@ -57,7 +57,7 @@ struct RootView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             GroupBox("Aspect Preset") {
                 Picker(
                     "Aspect Preset",
@@ -75,36 +75,98 @@ struct RootView: View {
             }
 
             GroupBox("Resize Output") {
-                HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle(
+                        "Match output size to crop",
+                        isOn: Binding(
+                            get: { viewModel.autoSizeToCrop },
+                            set: { viewModel.setAutoSizeToCrop($0) }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .font(.caption)
+
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Width")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            TextField(
+                                "Width",
+                                text: Binding(
+                                    get: { viewModel.resizeWidth },
+                                    set: { viewModel.updateResizeWidth($0) }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(viewModel.autoSizeToCrop)
+                        }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Height")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            TextField(
+                                "Height",
+                                text: Binding(
+                                    get: { viewModel.resizeHeight },
+                                    set: { viewModel.updateResizeHeight($0) }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(viewModel.autoSizeToCrop)
+                        }
+                    }
+                }
+            }
+
+            GroupBox("Shell Actions (.zshrc)") {
+                VStack(alignment: .leading, spacing: 8) {
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                        actionButton(.luma)
+                        actionButton(.slice)
+                        actionButton(.rem)
+                        actionButton(.gm)
+                    }
+
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Width")
+                        Text("Custom command")
                             .font(.caption)
                             .foregroundStyle(.secondary)
 
                         TextField(
-                            "Width",
-                            text: Binding(
-                                get: { viewModel.resizeWidth },
-                                set: { viewModel.updateResizeWidth($0) }
-                            )
+                            "Example: luma {input}",
+                            text: $viewModel.customCommandTemplate
                         )
                         .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+
+                        HStack {
+                            Button("Run Custom") {
+                                viewModel.runCustomShellCommand()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.customCommandTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)
+
+                            Spacer()
+                        }
                     }
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Height")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        TextField(
-                            "Height",
-                            text: Binding(
-                                get: { viewModel.resizeHeight },
-                                set: { viewModel.updateResizeHeight($0) }
-                            )
-                        )
-                        .textFieldStyle(.roundedBorder)
+                    if viewModel.isRunningShellAction {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Running shell action...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
+
+                    Text("Placeholders: {input}, {dir}, {stem}, {name}")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -138,7 +200,7 @@ struct RootView: View {
                             .controlSize(.small)
                     }
                 }
-                .frame(height: 190)
+                .frame(height: 150)
             }
 
             Spacer(minLength: 0)
@@ -155,12 +217,27 @@ struct RootView: View {
                 .font(.system(size: 34))
                 .foregroundStyle(.secondary)
 
-            Text("Launch from Finder")
-                .font(.headline)
+            if viewModel.needsPersistentFolderAccess {
+                Text("Grant Folder Access Once")
+                    .font(.headline)
 
-            Text("Right-click a PNG file and run Quick Action: Edit Image")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                Text("Allow access to \(viewModel.pendingAccessFolderName) to stop repeated permission prompts.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                Button("Grant Access") {
+                    viewModel.grantPersistentFolderAccess()
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                Text("Launch from Finder")
+                    .font(.headline)
+
+                Text("Right-click a PNG file and run Quick Action: Edit Image")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(
@@ -182,7 +259,7 @@ struct RootView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             } else {
-                Text("Resize using side/corner handles. Cmd+Return = Done, Esc = Cancel, Option+Drag outside = redraw")
+                Text("Cmd+Return = Done, Esc = Cancel")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -199,7 +276,15 @@ struct RootView: View {
             }
             .keyboardShortcut(.return, modifiers: [.command])
             .buttonStyle(.borderedProminent)
-            .disabled(!viewModel.hasLoadedImage || viewModel.isSaving)
+            .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)
         }
+    }
+
+    private func actionButton(_ action: ShellImageAction) -> some View {
+        Button(action.title) {
+            viewModel.runShellAction(action)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)
     }
 }

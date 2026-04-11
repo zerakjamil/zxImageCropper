@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 enum PipelineError: LocalizedError {
     case fileNotFound
+    case permissionDenied
     case unsupportedFormat
     case unableToLoadImage
     case renderFailed
@@ -14,6 +15,8 @@ enum PipelineError: LocalizedError {
         switch self {
         case .fileNotFound:
             return "Image file not found."
+        case .permissionDenied:
+            return "Permission denied. Grant folder access and try again."
         case .unsupportedFormat:
             return "This MVP supports PNG files only."
         case .unableToLoadImage:
@@ -38,6 +41,13 @@ enum ImagePipeline {
     static func loadPNG(at url: URL) throws -> LoadedImage {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw PipelineError.fileNotFound
+        }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            try handle.close()
+        } catch {
+            throw PipelineError.permissionDenied
         }
 
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
