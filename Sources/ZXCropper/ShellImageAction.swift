@@ -4,6 +4,7 @@ enum ShellImageAction: String, CaseIterable, Identifiable {
     case luma
     case slice
     case rem
+    case remgreen
     case gm
 
     var id: String { rawValue }
@@ -20,7 +21,7 @@ enum ShellImageAction: String, CaseIterable, Identifiable {
         switch self {
         case .slice:
             return false
-        case .luma, .rem, .gm:
+        case .luma, .rem, .remgreen, .gm:
             return true
         }
     }

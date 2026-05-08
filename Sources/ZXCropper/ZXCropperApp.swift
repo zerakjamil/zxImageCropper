@@ -23,6 +23,11 @@ struct ZXCropperApp: App {
                     idealHeight: 730,
                     maxHeight: 820
                 )
+                .onAppear {
+                    appDelegate.onOpenFile = { [weak viewModel] url in
+                        viewModel?.handleOpenFile(at: url)
+                    }
+                }
         }
         .windowToolbarStyle(.unifiedCompact)
     }

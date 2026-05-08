@@ -52,6 +52,10 @@ struct WindowOnTopEnforcer: NSViewRepresentable {
             applyCompactWindowConstraints(window, forceCompactFrame: true)
         }
 
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -60,6 +64,9 @@ struct WindowOnTopEnforcer: NSViewRepresentable {
         // One delayed promotion helps in cases where Finder/services steals focus back briefly.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
             NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
         }

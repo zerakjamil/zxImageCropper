@@ -16,6 +16,11 @@ let package = Package(
         .executableTarget(
             name: "ZXCropper",
             path: "Sources/ZXCropper"
+        ),
+        .testTarget(
+            name: "ZXCropperTests",
+            dependencies: ["ZXCropper"],
+            path: "Tests/ZXCropperTests"
         )
     ]
 )

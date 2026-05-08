@@ -1,34 +1,41 @@
 import AppKit
 
 final class AppActivationDelegate: NSObject, NSApplicationDelegate {
+    var onOpenFile: ((URL) -> Void)?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        promoteEditorWindowsWithRetries()
+        focusEditorWindows(ignoringOtherApps: true)
     }
 
-    func applicationDidBecomeActive(_ notification: Notification) {
-        promoteEditorWindowsWithRetries()
-    }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        promoteEditorWindowsWithRetries()
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        let url = URL(fileURLWithPath: filename)
+        onOpenFile?(url)
         return true
     }
 
-    private func promoteEditorWindowsWithRetries() {
-        for index in 0...20 {
-            let delay = DispatchTime.now() + (0.10 * Double(index))
-            DispatchQueue.main.asyncAfter(deadline: delay) {
-                NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.unhide(nil)
+    func applicationDidBecomeActive(_ notification: Notification) {
+        focusEditorWindows(ignoringOtherApps: false)
+    }
 
-                let candidateWindows = NSApp.windows.filter { !$0.isMiniaturized }
-                for window in candidateWindows {
-                    window.level = .floating
-                    window.makeKeyAndOrderFront(nil)
-                    window.orderFrontRegardless()
-                }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        focusEditorWindows(ignoringOtherApps: true)
+        return true
+    }
+
+    private func focusEditorWindows(ignoringOtherApps: Bool) {
+        if ignoringOtherApps {
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        NSApp.unhide(nil)
+
+        for window in NSApp.windows {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
             }
+
+            window.makeKeyAndOrderFront(nil)
         }
     }
 }

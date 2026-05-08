@@ -1,6 +1,16 @@
 import AppKit
 import Foundation
 
+enum BrushShape: String, CaseIterable {
+    case circle = "Circle"
+    case square = "Square"
+}
+
+struct PolygonVertex: Equatable {
+    var anchor: CGPoint
+    var segmentControl: CGPoint?
+}
+
 final class EditorViewModel: ObservableObject {
     @Published var sourceImage: NSImage?
     @Published var previewImage: NSImage?
@@ -16,11 +26,54 @@ final class EditorViewModel: ObservableObject {
     @Published var isRenderingPreview = false
     @Published var isRunningShellAction = false
     @Published var lastShellCommandOutput: String = ""
+    @Published var remgreenFuzz: String = "25"
     @Published var customCommandTemplate: String = ""
     @Published var needsPersistentFolderAccess = false
     @Published var pendingAccessFolderName = ""
+    @Published var isEraseMode = false
+    @Published var eraseBrushSize: CGFloat = 20
+    @Published var brushShape: BrushShape = .circle
+    @Published var currentEraseStroke: [CGPoint] = []
+    @Published var zoomScale: CGFloat = 1.0
+    @Published var panOffset: CGSize = .zero
+    @Published var isPolygonMode = false
+    @Published var polygonVertices: [PolygonVertex] = []
+    @Published var isWandMode = false
+    @Published var wandTolerance: CGFloat = 32
+    @Published var wandContiguous = true
+    @Published var wandSelectionMask: CGImage?
+    @Published var wandContourPath: CGPath?
+    @Published var isRunningWand = false
+
+    var hasWandSelection: Bool {
+        wandSelectionMask != nil
+    }
 
     private let launchImagePath: String?
+    var eraseStrokes: [[CGPoint]] = []
+    var erasePolygons: [[PolygonVertex]] = []
+    private var erasedCGImage: CGImage?
+
+    var hasEraseStrokes: Bool {
+        !eraseStrokes.isEmpty || !erasePolygons.isEmpty || hasWandSelection
+    }
+
+    var isDrawingPolygon: Bool {
+        !polygonVertices.isEmpty
+    }
+
+    var canUndo: Bool {
+        (isDrawingPolygon && !vertexUndoStack.isEmpty) || !undoStack.isEmpty
+    }
+
+    var canRedo: Bool {
+        (isDrawingPolygon && !vertexRedoStack.isEmpty) || !redoStack.isEmpty
+    }
+
+    private var undoStack: [(strokes: [[CGPoint]], polygons: [[PolygonVertex]])] = []
+    private var redoStack: [(strokes: [[CGPoint]], polygons: [[PolygonVertex]])] = []
+    private var vertexUndoStack: [[PolygonVertex]] = []
+    private var vertexRedoStack: [[PolygonVertex]] = []
     private var loadedImage: LoadedImage?
     private var previewGeneration = 0
     private var pendingImageURLForAccess: URL?
@@ -32,6 +85,10 @@ final class EditorViewModel: ObservableObject {
 
     var hasLoadedImage: Bool {
         loadedImage != nil
+    }
+
+    var remgreenFuzzLabel: String {
+        resolvedRemgreenFuzz()
     }
 
     func onAppear() {
@@ -131,7 +188,7 @@ final class EditorViewModel: ObservableObject {
 
         let crop = cropRectNormalized
         let outputSize = resolvedOutputSize(fallback: loadedImage.cgImage)
-        let sourceImage = loadedImage.cgImage
+        let sourceCG = erasedCGImage ?? loadedImage.cgImage
         let sourceURL = loadedImage.url
         let sourceProperties = loadedImage.sourceProperties
 
@@ -140,7 +197,7 @@ final class EditorViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let finalImage = try ImagePipeline.render(
-                    cgImage: sourceImage,
+                    cgImage: sourceCG,
                     cropRectNormalized: crop,
                     outputPixels: outputSize
                 )
@@ -202,6 +259,7 @@ final class EditorViewModel: ObservableObject {
                 }
 
                 if let outputURL = result.outputImageURL {
+                    self.resetErase()
                     self.loadImage(at: outputURL)
                     self.infoMessage = "\(action.commandName) completed. Loaded \(outputURL.lastPathComponent)."
                 } else {
@@ -259,10 +317,69 @@ final class EditorViewModel: ObservableObject {
                 }
 
                 if let outputURL = result.outputImageURL {
+                    self.resetErase()
                     self.loadImage(at: outputURL)
                     self.infoMessage = "Custom command completed. Loaded \(outputURL.lastPathComponent)."
                 } else {
                     self.infoMessage = "Custom command completed. No single output image detected to reload."
+                }
+            }
+        }
+    }
+
+    func updateRemgreenFuzz(_ value: String) {
+        remgreenFuzz = value.filter(\.isNumber)
+    }
+
+    func runRemgreenWithFuzz() {
+        guard let loadedImage else {
+            return
+        }
+
+        guard !isRunningShellAction, !isSaving else {
+            return
+        }
+
+        let fuzz = resolvedRemgreenFuzz()
+        remgreenFuzz = fuzz
+
+        isRunningShellAction = true
+        errorMessage = nil
+        infoMessage = "Running remgreen \(fuzz)..."
+
+        let currentInputURL = loadedImage.url
+        let template = "remgreen \(fuzz) {input}"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = ShellActionRunner.run(
+                customCommandTemplate: template,
+                inputURL: currentInputURL,
+                expectsSingleImageOutput: true
+            )
+
+            DispatchQueue.main.async {
+                self.isRunningShellAction = false
+                self.lastShellCommandOutput = [result.stdout, result.stderr]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+
+                if result.exitCode != 0 {
+                    let stderrSummary = result.stderr
+                        .split(separator: "\n")
+                        .suffix(2)
+                        .joined(separator: " ")
+                    self.errorMessage = stderrSummary.isEmpty
+                        ? "remgreen \(fuzz) failed with exit code \(result.exitCode)."
+                        : stderrSummary
+                    return
+                }
+
+                if let outputURL = result.outputImageURL {
+                    self.resetErase()
+                    self.loadImage(at: outputURL)
+                    self.infoMessage = "remgreen \(fuzz) completed. Loaded \(outputURL.lastPathComponent)."
+                } else {
+                    self.infoMessage = "remgreen \(fuzz) completed. No single output image detected to reload."
                 }
             }
         }
@@ -284,6 +401,301 @@ final class EditorViewModel: ObservableObject {
         }
     }
 
+    func toggleEraseMode() {
+        isEraseMode.toggle()
+        if !isEraseMode {
+            endEraseStroke()
+        }
+    }
+
+    func addErasePoint(_ point: CGPoint) {
+        currentEraseStroke.append(point)
+    }
+
+    func endEraseStroke() {
+        guard !currentEraseStroke.isEmpty else { return }
+        pushUndoState()
+        eraseStrokes.append(currentEraseStroke)
+        currentEraseStroke.removeAll()
+        applyEraseToImage()
+    }
+
+    func togglePolygonMode() {
+        isPolygonMode.toggle()
+        if !isPolygonMode {
+            cancelPolygon()
+        }
+    }
+
+    func addPolygonVertex(_ vertex: PolygonVertex) {
+        vertexUndoStack.append(polygonVertices)
+        vertexRedoStack.removeAll()
+        polygonVertices.append(vertex)
+    }
+
+    func setSegmentControl(at index: Int, control: CGPoint) {
+        guard index < polygonVertices.count else { return }
+        var copy = polygonVertices
+        copy[index].segmentControl = control
+        polygonVertices = copy
+    }
+
+    func moveVertex(at index: Int, to anchor: CGPoint) {
+        guard index < polygonVertices.count else { return }
+        var copy = polygonVertices
+        copy[index].anchor = anchor
+        polygonVertices = copy
+    }
+
+    func runMagicWand(at point: CGPoint, additive: Bool) {
+        guard let loadedImage else { return }
+        isRunningWand = true
+        errorMessage = nil
+        let src = loadedImage.cgImage
+        let tol = wandTolerance
+        let contig = wandContiguous
+        let existingMask = additive ? wandSelectionMask : nil
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                var mask = try ImagePipeline.magicWandMask(
+                    cgImage: src, at: point,
+                    tolerance: tol, contiguous: contig
+                )
+                if let existing = existingMask {
+                    mask = try ImagePipeline.unionMask(existing: existing, with: mask)
+                }
+                let finalMask = mask
+                DispatchQueue.main.async {
+                    self.wandSelectionMask = finalMask
+                    self.wandContourPath = ImagePipeline.contourPath(from: finalMask)
+                    self.isRunningWand = false
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isRunningWand = false
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func invertWandSelection() {
+        guard let mask = wandSelectionMask else { return }
+        let w = mask.width; let h = mask.height
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.genericGrayGamma2_2),
+              let ctx = CGContext(data: nil, width: w, height: h,
+                                 bitsPerComponent: 8, bytesPerRow: 0,
+                                 space: colorSpace,
+                                 bitmapInfo: CGImageAlphaInfo.none.rawValue),
+              let data = ctx.data,
+              let srcData = mask.dataProvider?.data,
+              let srcPtr = CFDataGetBytePtr(srcData)
+        else { return }
+        let ptr = data.bindMemory(to: UInt8.self, capacity: w * h)
+        let srcBytes = mask.bytesPerRow
+        for y in 0..<h {
+            for x in 0..<w {
+                ptr[y * w + x] = srcPtr[y * srcBytes + x] > 128 ? 0 : 255
+            }
+        }
+        if let inverted = ctx.makeImage() {
+            wandSelectionMask = inverted
+            wandContourPath = ImagePipeline.contourPath(from: inverted)
+        }
+    }
+
+    func deleteWandSelection() {
+        guard let loadedImage, let mask = wandSelectionMask else { return }
+        pushUndoState()
+        wandSelectionMask = nil
+        isWandMode = false
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try ImagePipeline.applyEraseMask(
+                    cgImage: loadedImage.cgImage,
+                    strokes: self.eraseStrokes,
+                    polygons: self.erasePolygons,
+                    brushSize: self.eraseBrushSize,
+                    brushShape: self.brushShape,
+                    selectionMask: mask
+                )
+                let display = NSImage(cgImage: result,
+                    size: NSSize(width: result.width, height: result.height))
+                DispatchQueue.main.async {
+                    self.erasedCGImage = result
+                    self.sourceImage = display
+                    self.schedulePreviewRender()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func clearWandSelection() {
+        wandSelectionMask = nil
+        wandContourPath = nil
+    }
+
+    func completePolygon() {
+        guard polygonVertices.count >= 3 else {
+            cancelPolygon()
+            return
+        }
+        pushUndoState()
+        erasePolygons.append(polygonVertices)
+        polygonVertices.removeAll()
+        vertexUndoStack.removeAll()
+        vertexRedoStack.removeAll()
+        applyEraseToImage()
+    }
+
+    func cancelPolygon() {
+        polygonVertices.removeAll()
+        vertexUndoStack.removeAll()
+        vertexRedoStack.removeAll()
+    }
+
+    func clearErase() {
+        guard !eraseStrokes.isEmpty || !erasePolygons.isEmpty else { return }
+        pushUndoState()
+        eraseStrokes.removeAll()
+        erasePolygons.removeAll()
+        currentEraseStroke.removeAll()
+        erasedCGImage = nil
+        guard let loadedImage else { return }
+        sourceImage = NSImage(
+            cgImage: loadedImage.cgImage,
+            size: NSSize(width: loadedImage.cgImage.width, height: loadedImage.cgImage.height)
+        )
+        schedulePreviewRender()
+    }
+
+    func undo() {
+        if isDrawingPolygon && !vertexUndoStack.isEmpty {
+            vertexRedoStack.append(polygonVertices)
+            polygonVertices = vertexUndoStack.removeLast()
+            return
+        }
+        guard !undoStack.isEmpty else { return }
+        let prev = undoStack.removeLast()
+        redoStack.append((strokes: eraseStrokes, polygons: erasePolygons))
+        eraseStrokes = prev.strokes
+        erasePolygons = prev.polygons
+        if eraseStrokes.isEmpty && erasePolygons.isEmpty {
+            clearEraseNoUndo()
+        } else {
+            applyEraseToImage()
+        }
+    }
+
+    func redo() {
+        if isDrawingPolygon && !vertexRedoStack.isEmpty {
+            vertexUndoStack.append(polygonVertices)
+            polygonVertices = vertexRedoStack.removeLast()
+            return
+        }
+        guard !redoStack.isEmpty else { return }
+        let next = redoStack.removeLast()
+        undoStack.append((strokes: eraseStrokes, polygons: erasePolygons))
+        eraseStrokes = next.strokes
+        erasePolygons = next.polygons
+        applyEraseToImage()
+    }
+
+    func resetErase() {
+        eraseStrokes.removeAll()
+        erasePolygons.removeAll()
+        currentEraseStroke.removeAll()
+        polygonVertices.removeAll()
+        vertexUndoStack.removeAll()
+        vertexRedoStack.removeAll()
+        erasedCGImage = nil
+        wandSelectionMask = nil
+    }
+
+    func zoomIn() {
+        zoomScale = min(zoomScale * 1.25, 10.0)
+        panOffset = .zero
+    }
+
+    func zoomOut() {
+        zoomScale = max(zoomScale / 1.25, 1.0)
+        panOffset = .zero
+    }
+
+    func resetZoom() {
+        zoomScale = 1.0
+        panOffset = .zero
+    }
+
+    func zoomToScale(_ scale: CGFloat, pan: CGSize) {
+        zoomScale = scale
+        panOffset = pan
+    }
+
+    func setZoomScale(_ scale: CGFloat) {
+        zoomScale = min(max(scale, 1.0), 10.0)
+    }
+
+    func setPanOffset(_ offset: CGSize) {
+        panOffset = offset
+    }
+
+    private func pushUndoState() {
+        undoStack.append((strokes: eraseStrokes, polygons: erasePolygons))
+        redoStack.removeAll()
+    }
+
+    private func clearEraseNoUndo() {
+        eraseStrokes.removeAll()
+        erasePolygons.removeAll()
+        currentEraseStroke.removeAll()
+        erasedCGImage = nil
+        guard let loadedImage else { return }
+        sourceImage = NSImage(
+            cgImage: loadedImage.cgImage,
+            size: NSSize(width: loadedImage.cgImage.width, height: loadedImage.cgImage.height)
+        )
+        schedulePreviewRender()
+    }
+
+    private func applyEraseToImage() {
+        guard let loadedImage, (!eraseStrokes.isEmpty || !erasePolygons.isEmpty) else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try ImagePipeline.applyEraseMask(
+                    cgImage: loadedImage.cgImage,
+                    strokes: self.eraseStrokes,
+                    polygons: self.erasePolygons,
+                    brushSize: self.eraseBrushSize,
+                    brushShape: self.brushShape
+                )
+                let display = NSImage(
+                    cgImage: result,
+                    size: NSSize(width: result.width, height: result.height)
+                )
+                DispatchQueue.main.async {
+                    self.erasedCGImage = result
+                    self.sourceImage = display
+                    self.schedulePreviewRender()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
     private func loadFromLaunchPath() {
         guard let launchImagePath, !launchImagePath.isEmpty else {
             errorMessage = "No image path was received. Launch this app from Finder Quick Action: Edit Image."
@@ -291,6 +703,12 @@ final class EditorViewModel: ObservableObject {
         }
 
         let url = Self.normalizePathArgument(launchImagePath)
+        loadImage(at: url)
+    }
+
+    func handleOpenFile(at url: URL) {
+        resetErase()
+        resetZoom()
         loadImage(at: url)
     }
 
@@ -309,7 +727,7 @@ final class EditorViewModel: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let loaded = try ImagePipeline.loadPNG(at: url)
+                let loaded = try ImagePipeline.loadImage(at: url)
                 let image = NSImage(
                     cgImage: loaded.cgImage,
                     size: NSSize(width: loaded.cgImage.width, height: loaded.cgImage.height)
@@ -355,7 +773,7 @@ final class EditorViewModel: ObservableObject {
         let generation = previewGeneration
         let crop = cropRectNormalized
         let outputSize = resolvedOutputSize(fallback: loadedImage.cgImage)
-        let sourceCG = loadedImage.cgImage
+        let sourceCG = erasedCGImage ?? loadedImage.cgImage
 
         isRenderingPreview = true
 
@@ -471,6 +889,11 @@ final class EditorViewModel: ObservableObject {
         normalized.origin.y = min(max(0, normalized.origin.y), 1 - normalized.height)
 
         return ImagePipeline.clampNormalizedRect(normalized)
+    }
+
+    private func resolvedRemgreenFuzz() -> String {
+        let digits = remgreenFuzz.filter(\.isNumber)
+        return digits.isEmpty ? "25" : digits
     }
 
     private static func normalizePathArgument(_ raw: String) -> URL {

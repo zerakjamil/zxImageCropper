@@ -10,8 +10,10 @@ struct ShellActionResult {
 enum ShellActionRunner {
     static func run(action: ShellImageAction, inputURL: URL) -> ShellActionResult {
         let startDate = Date()
-        let shellQuotedPath = shellQuote(inputURL.path)
-        let command = "\(action.commandName) \(shellQuotedPath)"
+        let command = buildCommand(
+            commandName: action.commandName,
+            arguments: [inputURL.path]
+        )
 
         return runCommand(
             command,
@@ -191,6 +193,10 @@ enum ShellActionRunner {
         return results
             .sorted(by: { $0.modified > $1.modified })
             .map(\.url)
+    }
+
+    static func buildCommand(commandName: String, arguments: [String]) -> String {
+        ([commandName] + arguments.map(shellQuote)).joined(separator: " ")
     }
 
     private static func shellQuote(_ text: String) -> String {

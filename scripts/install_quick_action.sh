@@ -45,6 +45,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
             <key>NSSendFileTypes</key>
             <array>
                 <string>public.png</string>
+                <string>org.webmproject.webp</string>
             </array>
         </dict>
     </array>
@@ -150,6 +151,9 @@ fi
     -e 'repeat 30 times' \
     -e 'try' \
     -e 'tell application id "com.zxcropper.app" to activate' \
+    -e 'end try' \
+    -e 'try' \
+    -e 'tell application "System Events" to tell process "ZXCropper" to set frontmost to true' \
     -e 'end try' \
     -e 'delay 0.08' \
     -e 'end repeat' \

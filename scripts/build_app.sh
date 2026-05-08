@@ -44,6 +44,59 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSServices</key>
+    <array>
+        <dict>
+            <key>NSMenuItem</key>
+            <dict>
+                <key>default</key>
+                <string>Edit Image</string>
+            </dict>
+            <key>NSMessage</key>
+            <string>editImageService</string>
+            <key>NSPortName</key>
+            <string>com.zxcropper.app</string>
+            <key>NSSendFileTypes</key>
+            <array>
+                <string>public.png</string>
+                <string>org.webmproject.webp</string>
+            </array>
+            <key>NSUserInterfaceType</key>
+            <string>None</string>
+            <key>NSRequiredContext</key>
+            <dict>
+                <key>NSApplicationIdentifier</key>
+                <string>com.zxcropper.app</string>
+            </dict>
+        </dict>
+    </array>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>PNG Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.png</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>WebP Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.webmproject.webp</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
