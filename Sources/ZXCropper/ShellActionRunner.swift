@@ -105,14 +105,6 @@ enum ShellActionRunner {
     ) -> URL? {
         let directory = inputURL.deletingLastPathComponent()
 
-        if action == .luma {
-            let baseName = inputURL.deletingPathExtension().lastPathComponent
-            let expected = directory.appendingPathComponent("\(baseName)_transparent.png")
-            if FileManager.default.fileExists(atPath: expected.path) {
-                return expected
-            }
-        }
-
         if let parsed = parseSavedPath(from: stdout),
            FileManager.default.fileExists(atPath: parsed.path) {
             return parsed

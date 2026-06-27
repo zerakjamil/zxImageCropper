@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var viewModel: EditorViewModel
+    @State private var showHelp = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -17,7 +18,7 @@ struct RootView: View {
                         ),
                         aspectRatio: viewModel.selectedAspectPreset.ratio,
                         isEraseMode: viewModel.isEraseMode,
-                        eraseStrokes: viewModel.eraseStrokes,
+                        eraseStrokes: [],
                         currentEraseStroke: viewModel.currentEraseStroke,
                         eraseBrushSize: viewModel.eraseBrushSize,
                         eraseBrushShape: viewModel.brushShape,
@@ -25,18 +26,43 @@ struct RootView: View {
                         onErasePoint: { viewModel.addErasePoint($0) },
                         onEraseEnd: { viewModel.endEraseStroke() },
                         isPolygonMode: viewModel.isPolygonMode,
+                        penShape: viewModel.penShape,
+                        onEraseShape: { viewModel.eraseShapeRegion(rect: $0, ellipse: $1) },
                         polygonVertices: viewModel.polygonVertices,
                         onPolygonVertex: { viewModel.addPolygonVertex($0) },
                         onPolygonComplete: { viewModel.completePolygon() },
-                        onSegmentCurve: { viewModel.setSegmentControl(at: $0, control: $1) },
+                        onPolygonRemoveLast: { viewModel.removeLastVertex() },
+                        onPolygonCancel: { viewModel.cancelPolygon() },
                         onMoveVertex: { viewModel.moveVertex(at: $0, to: $1) },
+                        onCurveSegment: { viewModel.curveSegment(at: $0, through: $1) },
                         isWandMode: viewModel.isWandMode,
                         wandContourPath: viewModel.wandContourPath,
                         onWandClick: { viewModel.runMagicWand(at: $0, additive: $1) },
                         onWandInvert: { viewModel.invertWandSelection() },
+                        isSliceMode: viewModel.isSliceMode,
+                        sliceRows: viewModel.resolvedSliceRows,
+                        sliceColumns: viewModel.resolvedSliceColumns,
+                        sliceAutoDetect: viewModel.sliceAutoDetect,
+                        detectedBoxes: viewModel.detectedBoxesNormalized,
                         panOffset: viewModel.panOffset,
                         onPanOffsetChange: { viewModel.setPanOffset($0) },
-                        onZoomToScale: { viewModel.zoomToScale($0, pan: $1) }
+                        onZoomToScale: { viewModel.zoomToScale($0, pan: $1) },
+                        darkSpotBoxes: viewModel.darkSpotBoxesNormalized,
+                        darkSpotShapes: viewModel.darkSpotShapes,
+                        onDarkSpotClick: { viewModel.removeDarkSpot(at: $0) },
+                        isSpriteBoxEditMode: viewModel.isSpriteBoxEditMode,
+                        onSpriteBoxesChanged: { viewModel.updateSpriteBoxes($0) },
+                        isRestoreMode: viewModel.isRestoreMode,
+                        removedSpotBoxes: viewModel.removedSpotBoxesNormalized,
+                        removedSpotShapes: viewModel.removedSpotShapes,
+                        onRemovedSpotClick: { viewModel.restoreRemovedSpot(at: $0) },
+                        originalImage: viewModel.originalImage,
+                        livePreviewImage: viewModel.lumaLivePreview,
+                        shapeOverlayImage: viewModel.shapeOverlayImage,
+                        isShapeRefineMode: viewModel.isShapeRefineMode,
+                        shapeRefineAdd: viewModel.shapeRefineAdd,
+                        pixelSize: viewModel.imagePixelSize,
+                        onSelectTool: { viewModel.selectTool($0) }
                     )
                     .frame(minWidth: 560, minHeight: 360)
                     .overlay(zoomOverlay, alignment: .bottomTrailing)
@@ -56,6 +82,12 @@ struct RootView: View {
                         Button("") { viewModel.redo() }
                             .keyboardShortcut("z", modifiers: [.command, .shift])
                             .hidden()
+                        Button("") { viewModel.detectShape() }
+                            .keyboardShortcut("d", modifiers: .command)
+                            .hidden()
+                        Button("") { viewModel.extractShape() }
+                            .keyboardShortcut("e", modifiers: .command)
+                            .hidden()
                     }
 
                     sidebar
@@ -69,6 +101,17 @@ struct RootView: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            // Global hidden shortcut: paste an image / file with Cmd+V.
+            Button("") { viewModel.pasteFromClipboard() }
+                .keyboardShortcut("v", modifiers: .command)
+                .hidden()
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            viewModel.handleOpenFile(at: url)
+            return true
+        }
         .onAppear {
             viewModel.onAppear()
         }
@@ -91,6 +134,51 @@ struct RootView: View {
                 ProgressView()
                     .controlSize(.small)
             }
+
+            Button {
+                showHelp.toggle()
+            } label: {
+                Image(systemName: "questionmark.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Shortcuts")
+            .popover(isPresented: $showHelp, arrowEdge: .bottom) {
+                shortcutCheatSheet
+            }
+        }
+    }
+
+    private var shortcutCheatSheet: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Shortcuts")
+                .font(.headline)
+            Group {
+                shortcutRow("1 – 5", "Crop · Brush · Pen · Wand · Slice")
+                shortcutRow("⌘D / ⌘E", "Smart Cutout: detect / extract")
+                shortcutRow("Hold \\", "Compare with original")
+                shortcutRow("Scroll / Pinch", "Zoom in & out (at cursor)")
+                shortcutRow("Hold Z + drag", "Pan the image")
+                shortcutRow("Double-click", "Zoom to point")
+                shortcutRow("⌘Z / ⇧⌘Z", "Undo / Redo")
+                shortcutRow("⌘= / ⌘- / ⌘0", "Zoom in / out / reset")
+                shortcutRow("⌘V", "Paste image or file")
+                shortcutRow("Drag & drop", "Open a PNG / WebP")
+                shortcutRow("⌘Return / Esc", "Done / Cancel")
+            }
+            .font(.caption)
+        }
+        .padding(14)
+        .frame(width: 290)
+    }
+
+    private func shortcutRow(_ keys: String, _ description: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(keys)
+                .font(.system(.caption, design: .monospaced).weight(.semibold))
+                .frame(width: 92, alignment: .leading)
+            Text(description)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
     }
 
@@ -112,13 +200,33 @@ struct RootView: View {
                         }
                         .labelsHidden()
                         .pickerStyle(.segmented)
-                        .disabled(viewModel.isEraseMode || viewModel.isPolygonMode)
+                        .disabled(viewModel.isEraseMode || viewModel.isPolygonMode || viewModel.isSliceMode)
 
                         Toggle(
                             "Match crop size",
                             isOn: Binding(
                                 get: { viewModel.autoSizeToCrop },
                                 set: { viewModel.setAutoSizeToCrop($0) }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .font(.caption)
+
+                        Toggle(
+                            "Snap output to powers of 2",
+                            isOn: Binding(
+                                get: { viewModel.snapPowerOfTwo },
+                                set: { viewModel.setSnapPowerOfTwo($0) }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .font(.caption)
+
+                        Toggle(
+                            "Trim transparent edges on save",
+                            isOn: Binding(
+                                get: { viewModel.trimOnSave },
+                                set: { viewModel.setTrimOnSave($0) }
                             )
                         )
                         .toggleStyle(.switch)
@@ -158,35 +266,225 @@ struct RootView: View {
                         }
                         .buttonStyle(.bordered)
                         .font(.caption)
-                        .disabled(viewModel.isEraseMode || viewModel.isPolygonMode)
+                        .disabled(viewModel.isEraseMode || viewModel.isPolygonMode || viewModel.isSliceMode)
+                    }
+                }
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "wand.and.rays")
+                                .foregroundStyle(.red)
+                            Text("Smart Cutout")
+                                .font(.subheadline.weight(.semibold))
+                        }
+
+                        Text("Auto-detect the main shape, preview it in red, then cut everything around it away onto a transparent background.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        Text("Tolerance: \(String(format: "%.0f", viewModel.shapeTolerance))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Slider(value: $viewModel.shapeTolerance, in: 10...200, step: 1)
+                            .onChange(of: viewModel.shapeTolerance) { _ in viewModel.scheduleShapeDetection() }
+                            .help("How aggressively background colours are removed. Higher = trims more of a soft glow/halo; lower = keeps more of it.")
+
+                        Text("Edge feather: \(String(format: "%.0f", viewModel.shapeEdgeFeather))px")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Slider(value: $viewModel.shapeEdgeFeather, in: 0...20, step: 1)
+
+                        Toggle(
+                            "Keep largest shape only",
+                            isOn: Binding(
+                                get: { viewModel.shapeKeepLargest },
+                                set: { viewModel.setShapeKeepLargest($0) }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .font(.caption2)
+                        .help("Drop stray detached specks and keep only the single biggest shape.")
+
+                        Toggle("Auto-detect on open", isOn: $viewModel.autoDetectShapeOnOpen)
+                            .toggleStyle(.switch)
+                            .font(.caption2)
+                            .help("Run Detect Shape automatically whenever a new image is loaded.")
+
+                        HStack(spacing: 8) {
+                            Button {
+                                viewModel.detectShape()
+                            } label: {
+                                Label(viewModel.hasShapeDetection ? "Re-detect" : "Detect Shape", systemImage: "scope")
+                            }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
+                            .help("Detect the shape  (⌘D)")
+                            .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey || viewModel.isDetectingShape || viewModel.inFlightEdits > 0)
+
+                            if viewModel.hasShapeDetection {
+                                Button {
+                                    viewModel.clearShapeDetection()
+                                } label: {
+                                    Label("Clear", systemImage: "xmark")
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                            }
+
+                            Spacer()
+
+                            if viewModel.isDetectingShape {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
+
+                        if viewModel.hasShapeDetection {
+                            Divider()
+
+                            Text("Selected too much or too little? Adjust the red area:")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    viewModel.expandShape()
+                                } label: {
+                                    Label("Expand", systemImage: "arrow.up.left.and.arrow.down.right")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .help("Grow the whole selection outward a few pixels.")
+
+                                Button {
+                                    viewModel.shrinkShape()
+                                } label: {
+                                    Label("Shrink", systemImage: "arrow.down.right.and.arrow.up.left")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .help("Trim the whole selection inward a few pixels.")
+                            }
+
+                            Toggle(
+                                "Refine brush — paint to fix the edges",
+                                isOn: Binding(
+                                    get: { viewModel.isShapeRefineMode },
+                                    set: { viewModel.setShapeRefineMode($0) }
+                                )
+                            )
+                            .toggleStyle(.switch)
+                            .font(.caption2)
+
+                            if viewModel.isShapeRefineMode {
+                                Picker("", selection: $viewModel.shapeRefineAdd) {
+                                    Text("\(Image(systemName: "minus.circle")) Remove").tag(false)
+                                    Text("\(Image(systemName: "plus.circle")) Add").tag(true)
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+
+                                Text("Brush size: \(String(format: "%.0f", viewModel.eraseBrushSize))px")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Slider(value: $viewModel.eraseBrushSize, in: 2...1000, step: 1)
+
+                                Text(viewModel.shapeRefineAdd
+                                     ? "Paint over parts that were missed to include them."
+                                     : "Paint over the unneeded parts to cut them out.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    viewModel.undoShapeMask()
+                                } label: {
+                                    Image(systemName: "arrow.uturn.backward")
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .disabled(!viewModel.canUndoShapeMask)
+                                .help("Undo selection change  (⌘Z)")
+
+                                Button {
+                                    viewModel.redoShapeMask()
+                                } label: {
+                                    Image(systemName: "arrow.uturn.forward")
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .disabled(!viewModel.canRedoShapeMask)
+                                .help("Redo selection change  (⇧⌘Z)")
+
+                                Spacer()
+                            }
+                        }
+
+                        Button {
+                            viewModel.extractShape()
+                        } label: {
+                            Label("Extract & Crop", systemImage: "scissors")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .font(.caption)
+                        .help("Cut everything around the selection  (⌘E)")
+                        .disabled(!viewModel.hasShapeDetection || viewModel.isSaving || viewModel.isRunningLumaKey || viewModel.isRunningShellAction || viewModel.inFlightEdits > 0)
                     }
                 }
 
                 GroupBox("Erase") {
                     VStack(alignment: .leading, spacing: 8) {
                         Picker("Mode", selection: Binding(
-                            get: {
-                                if viewModel.isWandMode { return 3 }
-                                if viewModel.isPolygonMode { return 2 }
-                                if viewModel.isEraseMode { return 1 }
-                                return 0
-                            },
-                            set: { value in
-                                viewModel.isEraseMode = value == 1
-                                viewModel.isPolygonMode = value == 2
-                                viewModel.isWandMode = value == 3
-                                if value != 2 { viewModel.cancelPolygon() }
-                                if value != 3 { viewModel.clearWandSelection() }
-                            }
+                            get: { viewModel.currentEditTool },
+                            set: { viewModel.selectEditTool($0) }
                         )) {
                             Text("\(Image(systemName: "xmark.circle")) Off").tag(0)
                             Text("\(Image(systemName: "paintbrush.pointed")) Brush").tag(1)
                             Text("\(Image(systemName: "pencil.tip")) Pen").tag(2)
                             Text("\(Image(systemName: "wand.and.stars")) Wand").tag(3)
+                            Text("\(Image(systemName: "arrow.uturn.backward.circle")) Restore").tag(4)
                         }
                         .pickerStyle(.segmented)
 
-                        if viewModel.isEraseMode {
+                        if viewModel.isRestoreMode {
+                            Text("Paint to bring back original pixels the key removed.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if viewModel.isEraseMode || viewModel.isPolygonMode {
+                            Toggle(
+                                "Erase dark background only",
+                                isOn: $viewModel.eraseBackgroundOnly
+                            )
+                            .toggleStyle(.switch)
+                            .font(.caption)
+                            .help("Within your brush/lasso, only near-black pixels (using the Luma Key threshold) are removed — bright art is kept. Clean the middle without affecting connected areas like the lower part.")
+
+                            if viewModel.eraseBackgroundOnly {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("BG threshold: \(String(format: "%.0f", viewModel.lumaKeyThreshold))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Slider(value: $viewModel.lumaKeyThreshold, in: 5...80, step: 1)
+
+                                    Text("BG softness: \(String(format: "%.0f", viewModel.lumaKeySoftness))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    Slider(value: $viewModel.lumaKeySoftness, in: 0...60, step: 1)
+
+                                    Text("Paint or lasso the area to clean — only dark background goes.")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+
+                        if viewModel.isEraseMode || viewModel.isRestoreMode {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Text("Size: \(String(format: "%.0f", viewModel.eraseBrushSize))px")
@@ -209,35 +507,70 @@ struct RootView: View {
                                     in: 2...1000,
                                     step: 1
                                 )
+
+                                Text("Hardness: \(String(format: "%.0f", viewModel.eraseBrushHardness * 100))%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                Slider(
+                                    value: $viewModel.eraseBrushHardness,
+                                    in: 0.1...1.0,
+                                    step: 0.05
+                                )
+                                .disabled(viewModel.brushShape == .square)
                             }
                         }
 
                         if viewModel.isPolygonMode {
                             VStack(alignment: .leading, spacing: 6) {
-                                if viewModel.isDrawingPolygon {
-                                    Text("\(viewModel.polygonVertices.count) pts — Click near 1st dot to close")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                Picker("Shape", selection: Binding(
+                                    get: { viewModel.penShape },
+                                    set: {
+                                        viewModel.penShape = $0
+                                        viewModel.cancelPolygon()
+                                    }
+                                )) {
+                                    Text("\(Image(systemName: "scribble")) Free").tag(PenShape.free)
+                                    Text("\(Image(systemName: "rectangle")) Rect").tag(PenShape.rectangle)
+                                    Text("\(Image(systemName: "circle")) Ellipse").tag(PenShape.ellipse)
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
 
-                                    HStack(spacing: 8) {
-                                        Button {
-                                            viewModel.completePolygon()
-                                        } label: {
-                                            Label("Complete", systemImage: "checkmark")
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .font(.caption)
+                                if viewModel.penShape == .free {
+                                    if viewModel.isDrawingPolygon {
+                                        Text("\(viewModel.polygonVertices.count) pts — drag the line between dots to curve it")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
 
-                                        Button(role: .destructive) {
-                                            viewModel.cancelPolygon()
-                                        } label: {
-                                            Label("Cancel", systemImage: "xmark")
+                                        Text("Drag a dot to move • Return/1st dot closes • Backspace removes last • Esc cancels")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+
+                                        HStack(spacing: 8) {
+                                            Button {
+                                                viewModel.completePolygon()
+                                            } label: {
+                                                Label("Complete", systemImage: "checkmark")
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                            .font(.caption)
+
+                                            Button(role: .destructive) {
+                                                viewModel.cancelPolygon()
+                                            } label: {
+                                                Label("Cancel", systemImage: "xmark")
+                                            }
+                                            .buttonStyle(.bordered)
+                                            .font(.caption)
                                         }
-                                        .buttonStyle(.bordered)
-                                        .font(.caption)
+                                    } else {
+                                        Text("Click to place dots; then drag the line between dots to curve")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
                                     }
                                 } else {
-                                    Text("Click to place polygon vertices")
+                                    Text("Drag to cut a \(viewModel.penShape == .ellipse ? "circle/oval" : "rectangle/square") — hold Shift for a perfect \(viewModel.penShape == .ellipse ? "circle" : "square").")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -290,7 +623,21 @@ struct RootView: View {
                             }
                         }
 
-                        if viewModel.isEraseMode || viewModel.isPolygonMode || viewModel.isWandMode || viewModel.hasEraseStrokes {
+                        if viewModel.isEraseMode || viewModel.isPolygonMode || viewModel.isWandMode || viewModel.isRestoreMode {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Feather: \(String(format: "%.0f", viewModel.eraseFeather))px")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                Slider(
+                                    value: $viewModel.eraseFeather,
+                                    in: 0...20,
+                                    step: 1
+                                )
+                            }
+                        }
+
+                        if viewModel.isEraseMode || viewModel.isPolygonMode || viewModel.isWandMode || viewModel.isRestoreMode || viewModel.hasEdits {
                             HStack(spacing: 8) {
                                 Button {
                                     viewModel.undo()
@@ -312,11 +659,11 @@ struct RootView: View {
 
                                 Spacer()
 
-                                if viewModel.hasEraseStrokes {
+                                if viewModel.hasEdits {
                                     Button(role: .destructive) {
                                         viewModel.clearErase()
                                     } label: {
-                                        Label("Clear", systemImage: "trash")
+                                        Label("Reset edits", systemImage: "trash")
                                     }
                                     .buttonStyle(.bordered)
                                     .font(.caption)
@@ -326,80 +673,369 @@ struct RootView: View {
                     }
                 }
 
-                GroupBox("Shell Actions (.zshrc)") {
-                VStack(alignment: .leading, spacing: 8) {
-                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                        actionButton(.luma)
-                        actionButton(.slice)
-                        actionButton(.rem)
-                        actionButton(.remgreen)
-                        actionButton(.gm)
-                        remgreenFuzzButton
-                    }
-
-                    HStack(spacing: 8) {
-                        Text("Fuzz")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        TextField(
-                            "25",
-                            text: Binding(
-                                get: { viewModel.remgreenFuzz },
-                                set: { viewModel.updateRemgreenFuzz($0) }
+                GroupBox("Slice") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Toggle(
+                            "Slice preview",
+                            isOn: Binding(
+                                get: { viewModel.isSliceMode },
+                                set: { _ in viewModel.toggleSliceMode() }
                             )
                         )
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(width: 60)
-                        .disabled(viewModel.isSaving || viewModel.isRunningShellAction)
+                        .toggleStyle(.switch)
+                        .font(.caption)
 
-                        Spacer()
-                    }
+                        Picker("", selection: Binding(
+                            get: { viewModel.sliceAutoDetect },
+                            set: { viewModel.setSliceAutoDetect($0) }
+                        )) {
+                            Text("Grid").tag(false)
+                            Text("Auto-detect").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Custom command")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-
-                        TextField(
-                            "Example: luma {input}",
-                            text: $viewModel.customCommandTemplate
-                        )
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.caption, design: .monospaced))
-
-                        HStack {
-                            Button("Run Custom") {
-                                viewModel.runCustomShellCommand()
+                        if viewModel.sliceAutoDetect {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Min size (px)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    TextField("Min", text: Binding(
+                                        get: { viewModel.spriteMinSize },
+                                        set: { viewModel.updateSpriteMinSize($0) }
+                                    ))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption)
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Padding (px)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    TextField("Pad", text: Binding(
+                                        get: { viewModel.spritePadding },
+                                        set: { viewModel.updateSpritePadding($0) }
+                                    ))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption)
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Gap (px)")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    TextField("Gap", text: Binding(
+                                        get: { viewModel.spriteGap },
+                                        set: { viewModel.updateSpriteGap($0) }
+                                    ))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption)
+                                }
                             }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(viewModel.customCommandTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)
 
-                            Spacer()
+                            HStack {
+                                if viewModel.isDetectingSprites {
+                                    Text("Detecting…")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                } else {
+                                    Text("\(viewModel.detectedSpriteBoxes.count) sprites found")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button {
+                                    viewModel.detectSprites()
+                                } label: {
+                                    Label("Re-detect", systemImage: "arrow.clockwise")
+                                }
+                                .font(.caption2)
+                                .disabled(!viewModel.hasLoadedImage || !viewModel.isSliceMode)
+                            }
+
+                            if !viewModel.detectedSpriteBoxes.isEmpty {
+                                Toggle(
+                                    "Edit boxes",
+                                    isOn: Binding(
+                                        get: { viewModel.isSpriteBoxEditMode },
+                                        set: { viewModel.isSpriteBoxEditMode = $0 }
+                                    )
+                                )
+                                .toggleStyle(.switch)
+                                .font(.caption2)
+
+                                if viewModel.isSpriteBoxEditMode {
+                                    HStack(spacing: 6) {
+                                        Button {
+                                            viewModel.addSpriteBox()
+                                        } label: {
+                                            Label("Add Box", systemImage: "plus.square")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .font(.caption2)
+
+                                        Spacer()
+
+                                        Text("Drag to move • Handles to resize • Right-click to delete/split")
+                                            .font(.system(size: 9))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        } else {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Rows")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    TextField("Rows", text: Binding(
+                                        get: { viewModel.sliceRows },
+                                        set: { viewModel.updateSliceRows($0) }
+                                    ))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption)
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Columns")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                    TextField("Cols", text: Binding(
+                                        get: { viewModel.sliceColumns },
+                                        set: { viewModel.updateSliceColumns($0) }
+                                    ))
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.caption)
+                                }
+                            }
+
+                            Text("\(viewModel.resolvedSliceRows * viewModel.resolvedSliceColumns) sprites, left→right top→bottom")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Toggle(
+                            "Also export packed atlas (PNG + JSON)",
+                            isOn: $viewModel.exportAtlas
+                        )
+                        .toggleStyle(.switch)
+                        .font(.caption2)
+
+                        Button {
+                            viewModel.exportSprites()
+                        } label: {
+                            Label("Export Sprites", systemImage: "square.grid.3x3")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .font(.caption)
+                        .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey)
+                    }
+                }
+
+                GroupBox("Shell Actions (.zshrc)") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                            actionButton(.rem)
+                            actionButton(.slice)
+                        }
+
+                        if viewModel.isRunningShellAction {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Running shell action...")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
+                }
 
-                    if viewModel.isRunningShellAction {
+            GroupBox("Luma Key (Black BG → Alpha)") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Flood-fills from edges — removes only black connected to the border. Dark parts inside the asset are preserved.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Text("Threshold: \(String(format: "%.0f", viewModel.lumaKeyThreshold))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Slider(
+                        value: $viewModel.lumaKeyThreshold,
+                        in: 5...80,
+                        step: 1
+                    )
+                    .onChange(of: viewModel.lumaKeyThreshold) { _ in viewModel.scheduleLumaPreview() }
+
+                    Text("Softness: \(String(format: "%.0f", viewModel.lumaKeySoftness))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Slider(
+                        value: $viewModel.lumaKeySoftness,
+                        in: 0...60,
+                        step: 1
+                    )
+                    .onChange(of: viewModel.lumaKeySoftness) { _ in viewModel.scheduleLumaPreview() }
+
+                    Text("Feather: \(String(format: "%.0f", viewModel.lumaKeyFeather))px")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Slider(
+                        value: $viewModel.lumaKeyFeather,
+                        in: 0...20,
+                        step: 1
+                    )
+                    .onChange(of: viewModel.lumaKeyFeather) { _ in viewModel.scheduleLumaPreview() }
+
+                    Text("Tip: drag the sliders to preview live, then Run to apply.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        viewModel.runLumaKey()
+                    } label: {
+                        Label("Run Luma Key", systemImage: "moon.z")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.caption)
+                    .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey)
+
+                    if viewModel.isRunningLumaKey {
                         HStack(spacing: 6) {
                             ProgressView()
                                 .controlSize(.small)
-                            Text("Running shell action...")
+                            Text("Keying...")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
 
-                    Text("Placeholders: {input}, {dir}, {stem}, {name}")
+                    Divider()
+
+                    HStack(spacing: 8) {
+                        Text("Min spot size")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        TextField("16", text: Binding(
+                            get: { viewModel.darkSpotMinSize },
+                            set: { viewModel.updateDarkSpotMinSize($0) }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .frame(width: 60)
+                        Spacer()
+                    }
+
+                    Toggle(
+                        "Include luma-key areas (edge-connected)",
+                        isOn: Binding(
+                            get: { viewModel.darkSpotIncludeEdges },
+                            set: { viewModel.setDarkSpotIncludeEdges($0) }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .font(.caption2)
+                    .help("Also detect the dark regions a Luma Key would remove, so you can take them out selectively instead of all at once.")
+
+                    Button {
+                        viewModel.detectDarkSpots()
+                    } label: {
+                        Label("Detect Dark Spots", systemImage: "scope")
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                    .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey || viewModel.isDetectingDarkSpots)
+
+                    if viewModel.isDetectingDarkSpots {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Detecting...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if !viewModel.detectedDarkSpots.isEmpty {
+                        HStack {
+                            Text("\(viewModel.detectedDarkSpots.count) spot\(viewModel.detectedDarkSpots.count == 1 ? "" : "s") — click to remove")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                            Spacer()
+                            Button("Remove All") {
+                                viewModel.removeAllDarkSpots()
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.isSaving || viewModel.inFlightEdits > 0)
+                            Button("Clear") {
+                                viewModel.clearDarkSpots()
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    Divider()
+
+                    Text("Restore parts the key removed: detect enclosed holes, or use the Restore brush (tool 5 → Restore) for edge-connected areas.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+
+                    HStack(spacing: 8) {
+                        Text("Min area")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        TextField("16", text: Binding(
+                            get: { viewModel.removedSpotMinSize },
+                            set: { viewModel.updateRemovedSpotMinSize($0) }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .frame(width: 60)
+                        Spacer()
+                    }
+
+                    Button {
+                        viewModel.detectRemovedSpots()
+                    } label: {
+                        Label("Detect Removed Spots", systemImage: "arrow.uturn.backward.square")
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                    .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey || viewModel.isDetectingRemovedSpots)
+
+                    if viewModel.isDetectingRemovedSpots {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Detecting...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if !viewModel.detectedRemovedSpots.isEmpty {
+                        HStack {
+                            Text("\(viewModel.detectedRemovedSpots.count) area\(viewModel.detectedRemovedSpots.count == 1 ? "" : "s") — click to restore")
+                                .font(.caption2)
+                                .foregroundStyle(.green)
+                            Spacer()
+                            Button("Clear") {
+                                viewModel.clearRemovedSpots()
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.bordered)
+                        }
+                    }
                 }
             }
 
             GroupBox("Preview") {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color(NSColor.windowBackgroundColor))
+                    CheckerboardView()
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
 
                     if let previewImage = viewModel.previewImage {
                         Image(nsImage: previewImage)
@@ -489,21 +1125,13 @@ struct RootView: View {
             }
             .keyboardShortcut(.return, modifiers: [.command])
             .buttonStyle(.borderedProminent)
-            .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)
+            .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey || viewModel.inFlightEdits > 0)
         }
     }
 
     private func actionButton(_ action: ShellImageAction) -> some View {
         Button(action.title) {
             viewModel.runShellAction(action)
-        }
-        .buttonStyle(.bordered)
-        .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)
-    }
-
-    private var remgreenFuzzButton: some View {
-        Button("REMGREEN \(viewModel.remgreenFuzzLabel)") {
-            viewModel.runRemgreenWithFuzz()
         }
         .buttonStyle(.bordered)
         .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction)

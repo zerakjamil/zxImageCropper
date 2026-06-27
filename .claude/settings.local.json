@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/zerakjamil/rembg/**)",
+      "Bash(python3 -m pip show rembg)",
+      "Bash(swift --version)",
+      "Bash(~/rembg/.venv/bin/python -c \"import rembg, rembg.bg; print\\('rembg pkg:', rembg.__file__\\)\")",
+      "Bash(mkdir -p /tmp/bgtest)",
+      "Bash(cp __TRACKED_VAR__/Gemini_Generated_Image_az3dniaz3dniaz3d.png /tmp/bgtest/navy.png)",
+      "Bash(cp __TRACKED_VAR__/Gemini_Generated_Image_az3dniaz3dniaz3d_rmbg.backup-20260615-054038-791.png /tmp/bgtest/navy_oldrmbg.png)",
+      "Bash(cp __TRACKED_VAR__/Gemini_Generated_Image_ytj7jqytj7jqytj7.png /tmp/bgtest/rings.png)",
+      "Bash(cp __TRACKED_VAR__/Gemini_Generated_Image_ytj7jqytj7jqytj7_rmbg.backup-20260615-064622-253.png /tmp/bgtest/rings_oldrmbg.png)",
+      "Bash(~/rembg/.venv/bin/python *)",
+      "Bash(swift build *)",
+      "Bash(echo \"REAL_EXIT=$?\")",
+      "Read(//tmp/**)",
+      "Bash(echo \"BUILD_EXIT=$?\")",
+      "Bash(swift test *)",
+      "Bash(echo \"TEST_EXIT=$?\")",
+      "Bash(./scripts/build_app.sh)",
+      "Bash(echo \"BUNDLE_EXIT=$?\")"
+    ]
+  }
+}
