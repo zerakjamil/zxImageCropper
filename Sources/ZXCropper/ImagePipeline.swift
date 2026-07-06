@@ -438,6 +438,75 @@ enum ImagePipeline {
         return output
     }
 
+    /// Rasterizes polygon vertices into a grayscale keep mask (255 = keep,
+    /// 0 = remove). Used by "Keep Inside" to preserve the polygon interior
+    /// and erase everything outside it.
+    static func rasterizeKeepMask(
+        width: Int,
+        height: Int,
+        polygons: [[PolygonVertex]],
+        feather: CGFloat
+    ) throws -> CGImage {
+        guard let grayCtx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let grayData = grayCtx.data else {
+            throw PipelineError.renderFailed
+        }
+
+        let grayBytesPerRow = grayCtx.bytesPerRow
+        let grayPtr = grayData.bindMemory(to: UInt8.self, capacity: height * grayBytesPerRow)
+        memset(grayPtr, 0, height * grayBytesPerRow)
+
+        grayCtx.setShouldAntialias(true)
+        grayCtx.setAllowsAntialiasing(true)
+        let white = CGColor(gray: 1.0, alpha: 1.0)
+        grayCtx.setFillColor(white)
+
+        for polygon in polygons {
+            guard polygon.count >= 3 else { continue }
+
+            grayCtx.beginPath()
+            grayCtx.move(to: cgPoint(polygon[0].anchor, width: width, height: height))
+
+            for i in 0..<polygon.count {
+                let next = (i + 1) % polygon.count
+                let start = polygon[i]
+                let end = polygon[next]
+                let to = cgPoint(end.anchor, width: width, height: height)
+
+                let control1 = start.controlOut.map { cgPoint($0, width: width, height: height) }
+                let control2 = end.controlIn.map { cgPoint($0, width: width, height: height) }
+
+                if control1 != nil || control2 != nil {
+                    let c1 = control1 ?? cgPoint(start.anchor, width: width, height: height)
+                    let c2 = control2 ?? to
+                    grayCtx.addCurve(to: to, control1: c1, control2: c2)
+                } else {
+                    grayCtx.addLine(to: to)
+                }
+            }
+
+            grayCtx.closePath()
+            grayCtx.fillPath()
+        }
+
+        guard var result = grayCtx.makeImage() else {
+            throw PipelineError.renderFailed
+        }
+
+        if feather > 0.01 {
+            result = blurGrayImage(result, radius: feather) ?? result
+        }
+
+        return result
+    }
+
     /// Stamps a soft radial-falloff disc (alpha 1 at center, 0 at edge) blended
     /// additively into the grayscale removal context via a CGGradient.
     private static func stampSoftDisc(in ctx: CGContext, center: CGPoint, radius: CGFloat, hardness: CGFloat) {

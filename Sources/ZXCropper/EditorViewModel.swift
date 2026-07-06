@@ -20,6 +20,22 @@ struct PolygonVertex: Equatable {
     var controlOut: CGPoint?
 }
 
+struct PolygonHistoryEntry {
+    let vertices: [PolygonVertex]
+    let isClosed: Bool
+}
+
+struct ImageHistoryEntry {
+    let image: CGImage?
+    let polygonVertices: [PolygonVertex]
+    let isPolygonClosed: Bool
+    let vertexUndoStack: [PolygonHistoryEntry]
+    let vertexRedoStack: [PolygonHistoryEntry]
+    let editToolTag: Int
+    let isSliceMode: Bool
+}
+
+
 final class EditorViewModel: ObservableObject {
     @Published var sourceImage: NSImage?
     @Published var originalImage: NSImage?
@@ -51,8 +67,12 @@ final class EditorViewModel: ObservableObject {
     @Published var zoomScale: CGFloat = 1.0
     @Published var panOffset: CGSize = .zero
     @Published var isPolygonMode = false
+    @Published var penSmooth = false
     @Published var penShape: PenShape = .free
     @Published var polygonVertices: [PolygonVertex] = []
+    /// When true the pen path is visually closed and awaiting an action
+    /// (Complete / Keep Inside). No new vertices can be added.
+    @Published var isPolygonClosed = false
     @Published var isWandMode = false
     @Published var wandTolerance: CGFloat = 32
     @Published var wandContiguous = true
@@ -137,8 +157,8 @@ final class EditorViewModel: ObservableObject {
     /// destructive op (erase, pen, wand, luma key, dark-spot removal, restore)
     /// bakes into this image and pushes the previous state so Cmd+Z works
     /// uniformly across all of them.
-    private var imageUndoStack: [CGImage?] = []
-    private var imageRedoStack: [CGImage?] = []
+    private var imageUndoStack: [ImageHistoryEntry] = []
+    private var imageRedoStack: [ImageHistoryEntry] = []
     private let maxHistory = 12
 
     var hasEdits: Bool {
@@ -146,23 +166,35 @@ final class EditorViewModel: ObservableObject {
     }
 
     var isDrawingPolygon: Bool {
-        !polygonVertices.isEmpty
+        !polygonVertices.isEmpty && !isPolygonClosed
+    }
+
+    /// True when the pen path has been closed and the user must pick an action.
+    var isPolygonAwaitingAction: Bool {
+        !polygonVertices.isEmpty && isPolygonClosed
     }
 
     var canUndo: Bool {
-        (isDrawingPolygon && !vertexUndoStack.isEmpty)
+        ((isDrawingPolygon || isPolygonClosed) && !vertexUndoStack.isEmpty)
             || canUndoShapeMask
             || (inFlightEdits == 0 && !imageUndoStack.isEmpty)
     }
 
     var canRedo: Bool {
-        (isDrawingPolygon && !vertexRedoStack.isEmpty)
+        ((isDrawingPolygon || isPolygonClosed) && !vertexRedoStack.isEmpty)
             || canRedoShapeMask
             || (inFlightEdits == 0 && !imageRedoStack.isEmpty)
     }
 
-    private var vertexUndoStack: [[PolygonVertex]] = []
-    private var vertexRedoStack: [[PolygonVertex]] = []
+    private var vertexUndoStack: [PolygonHistoryEntry] = []
+    private var vertexRedoStack: [PolygonHistoryEntry] = []
+    private struct PendingPolygonState {
+        let vertices: [PolygonVertex]
+        let isClosed: Bool
+        let undoStack: [PolygonHistoryEntry]
+        let redoStack: [PolygonHistoryEntry]
+    }
+    private var pendingPolygonHistoryEntry: PendingPolygonState?
     private var loadedImage: LoadedImage?
     private var previewGeneration = 0
     private var lumaPreviewGeneration = 0
@@ -1221,9 +1253,57 @@ final class EditorViewModel: ObservableObject {
     }
 
     func addPolygonVertex(_ vertex: PolygonVertex) {
-        vertexUndoStack.append(polygonVertices)
+        guard !isPolygonClosed else { return }
+        vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
         vertexRedoStack.removeAll()
         polygonVertices.append(vertex)
+        if penSmooth { recomputeSmoothHandles() }
+    }
+
+    /// Visually closes the pen path without performing any erase/keep action.
+    /// The user must then tap Complete or Keep Inside.
+    func closePolygonPath() {
+        guard polygonVertices.count >= 3 else { return }
+        vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
+        vertexRedoStack.removeAll()
+        isPolygonClosed = true
+    }
+
+    func setPenSmooth(_ enabled: Bool) {
+        penSmooth = enabled
+        if enabled {
+            recomputeSmoothHandles()
+        }
+    }
+
+    /// Recomputes every anchor's handles as a **smooth closed spline** (Catmull-Rom
+    /// → Bézier) so adjacent segments share a tangent — no kinks. Place points around
+    /// a shape and the whole path flows smoothly through them (a circle for points on
+    /// a circle). Done in image-pixel space so it's circular on screen.
+    func recomputeSmoothHandles() {
+        let n = polygonVertices.count
+        guard n >= 3 else {
+            for i in polygonVertices.indices {
+                polygonVertices[i].controlOut = nil
+                polygonVertices[i].controlIn = nil
+            }
+            return
+        }
+        let w = CGFloat(loadedImage?.cgImage.width ?? 1)
+        let h = CGFloat(loadedImage?.cgImage.height ?? 1)
+        let p = polygonVertices.map { CGPoint(x: $0.anchor.x * w, y: $0.anchor.y * h) }
+        var verts = polygonVertices
+        for i in 0..<n {
+            let prev = p[(i - 1 + n) % n]
+            let cur = p[i]
+            let next = p[(i + 1) % n]
+            // Catmull-Rom tangent at this anchor; Bézier handle = anchor ± tangent/6·... .
+            let tx = (next.x - prev.x) / 6
+            let ty = (next.y - prev.y) / 6
+            verts[i].controlOut = CGPoint(x: (cur.x + tx) / w, y: (cur.y + ty) / h)
+            verts[i].controlIn = CGPoint(x: (cur.x - tx) / w, y: (cur.y - ty) / h)
+        }
+        polygonVertices = verts
     }
 
     func moveVertex(at index: Int, to anchor: CGPoint) {
@@ -1241,29 +1321,222 @@ final class EditorViewModel: ObservableObject {
             copy[index].controlIn = CGPoint(x: cin.x + delta.x, y: cin.y + delta.y)
         }
         polygonVertices = copy
+        // In smooth mode, re-flow the whole spline so neighbours stay tangent-continuous.
+        if penSmooth { recomputeSmoothHandles() }
     }
 
-    /// Bends the segment starting at `index` so its curve passes through `point`.
+    /// The circle through `a`, `p`, `b`, plus the signed sweep angle from `a` to `b`
+    /// that actually passes through `p`. `nil` if the three points are collinear
+    /// (no meaningful circle). Shared by the live-preview and final arc fits.
+    private func circularArc(from a: CGPoint, to b: CGPoint, through p: CGPoint) -> (center: CGPoint, radius: CGFloat, startAngle: CGFloat, sweep: CGFloat)? {
+        let det = 2 * (a.x * (p.y - b.y) + p.x * (b.y - a.y) + b.x * (a.y - p.y))
+        let chordLen = hypot(b.x - a.x, b.y - a.y)
+        // Perpendicular bulge of p off the chord (scale-invariant). If tiny, treat as straight.
+        let perpDist = chordLen > 1e-9 ? abs(det) / (2 * chordLen) : 0
+        guard chordLen > 1e-9, perpDist >= chordLen * 0.005 else { return nil }
+
+        let a2 = a.x * a.x + a.y * a.y
+        let p2 = p.x * p.x + p.y * p.y
+        let b2 = b.x * b.x + b.y * b.y
+        let ox = (a2 * (p.y - b.y) + p2 * (b.y - a.y) + b2 * (a.y - p.y)) / det
+        let oy = (a2 * (b.x - p.x) + p2 * (a.x - b.x) + b2 * (p.x - a.x)) / det
+        let center = CGPoint(x: ox, y: oy)
+        let radius = hypot(a.x - ox, a.y - oy)
+
+        let twoPi = CGFloat.pi * 2
+        func norm(_ angle: CGFloat) -> CGFloat {
+            var x = angle.truncatingRemainder(dividingBy: twoPi)
+            if x < 0 { x += twoPi }
+            return x
+        }
+        let aAng = atan2(a.y - oy, a.x - ox)
+        let bAng = atan2(b.y - oy, b.x - ox)
+        let pAng = atan2(p.y - oy, p.x - ox)
+        let sweepCCW = norm(bAng - aAng)
+        // Signed arc a→b that actually passes through p.
+        var sweep = norm(pAng - aAng) <= sweepCCW ? sweepCCW : sweepCCW - twoPi
+        sweep = max(-twoPi + 0.02, min(twoPi - 0.02, sweep))
+        return (center, radius, aAng, sweep)
+    }
+
+    private func ccwTangent(at q: CGPoint, center: CGPoint) -> CGPoint {
+        let vx = -(q.y - center.y)
+        let vy = (q.x - center.x)
+        let len = hypot(vx, vy)
+        return len > 1e-9 ? CGPoint(x: vx / len, y: vy / len) : .zero
+    }
+
+    /// Cheap live preview while dragging: bends the segment starting at `index`
+    /// into the single-cubic best fit of the circular arc through the two anchors
+    /// and `point`. A single cubic only stays visually circular up to roughly a
+    /// 90° bulge, but recomputing this on every drag frame needs to be fast and
+    /// must never change the vertex count (indices must stay stable mid-gesture) —
+    /// see `finalizeCurveSegment` for the exact multi-piece version committed on
+    /// release.
     func curveSegment(at index: Int, through point: CGPoint) {
+        // In smooth mode curvature is automatic (Catmull-Rom); manual arc-drag is off.
+        guard !penSmooth else { return }
         let count = polygonVertices.count
         guard count >= 2, index >= 0, index < count else { return }
         let next = (index + 1) % count
         var copy = polygonVertices
-        let a = copy[index].anchor
-        let b = copy[next].anchor
-        let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
-        let offset = CGPoint(x: point.x - mid.x, y: point.y - mid.y)
-        let k: CGFloat = 4.0 / 3.0
-        copy[index].controlOut = CGPoint(x: a.x + k * offset.x, y: a.y + k * offset.y)
-        copy[next].controlIn = CGPoint(x: b.x + k * offset.x, y: b.y + k * offset.y)
+
+        let w = CGFloat(loadedImage?.cgImage.width ?? 1)
+        let h = CGFloat(loadedImage?.cgImage.height ?? 1)
+        let a = CGPoint(x: copy[index].anchor.x * w, y: copy[index].anchor.y * h)
+        let b = CGPoint(x: copy[next].anchor.x * w, y: copy[next].anchor.y * h)
+        let p = CGPoint(x: point.x * w, y: point.y * h)
+
+        guard let arc = circularArc(from: a, to: b, through: p) else {
+            copy[index].controlOut = nil
+            copy[next].controlIn = nil
+            polygonVertices = copy
+            return
+        }
+
+        // Cubic control distance for a circular arc: (4/3)·tan(θ/4)·R.
+        let dist = (4.0 / 3.0) * tan(arc.sweep / 4) * arc.radius
+        let tA = ccwTangent(at: a, center: arc.center)
+        let tB = ccwTangent(at: b, center: arc.center)
+        let cOut = CGPoint(x: a.x + dist * tA.x, y: a.y + dist * tA.y)
+        let cIn = CGPoint(x: b.x - dist * tB.x, y: b.y - dist * tB.y)
+
+        copy[index].controlOut = CGPoint(x: cOut.x / w, y: cOut.y / h)
+        copy[next].controlIn = CGPoint(x: cIn.x / w, y: cIn.y / h)
         polygonVertices = copy
+    }
+
+    /// Commits the **exact** circular arc for the segment at `index`, called once
+    /// on drag release. A single cubic Bézier cannot represent a wide arc without
+    /// visible flattening — that's the "never circular" bug — so this splits the
+    /// bulge into multiple pieces of at most 90° each (where a cubic is accurate to
+    /// within a fraction of a percent), inserting extra anchors along the true
+    /// circle as needed. For a modest bulge (the common case) this is exactly one
+    /// piece, identical to `curveSegment`'s live preview — no visible change on
+    /// release. Only large bulges gain the extra points, and only then.
+    func finalizeCurveSegment(at index: Int, through point: CGPoint) {
+        guard !penSmooth else { return }
+        let count = polygonVertices.count
+        guard count >= 2, index >= 0, index < count else { return }
+        let next = (index + 1) % count
+        var copy = polygonVertices
+
+        vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
+        vertexRedoStack.removeAll()
+
+        let w = CGFloat(loadedImage?.cgImage.width ?? 1)
+        let h = CGFloat(loadedImage?.cgImage.height ?? 1)
+        let a = CGPoint(x: copy[index].anchor.x * w, y: copy[index].anchor.y * h)
+        let b = CGPoint(x: copy[next].anchor.x * w, y: copy[next].anchor.y * h)
+        let p = CGPoint(x: point.x * w, y: point.y * h)
+
+        guard let arc = circularArc(from: a, to: b, through: p) else {
+            copy[index].controlOut = nil
+            copy[next].controlIn = nil
+            polygonVertices = copy
+            return
+        }
+
+        let maxPieceSweep = CGFloat.pi / 2
+        let pieceCount = max(1, Int(ceil(abs(arc.sweep) / maxPieceSweep)))
+        let pieceSweep = arc.sweep / CGFloat(pieceCount)
+        let dist = (4.0 / 3.0) * tan(pieceSweep / 4) * arc.radius
+
+        func pointOnCircle(_ angle: CGFloat) -> CGPoint {
+            CGPoint(x: arc.center.x + arc.radius * cos(angle), y: arc.center.y + arc.radius * sin(angle))
+        }
+
+        var pieceAnchors: [PolygonVertex] = []
+        for i in 0...pieceCount {
+            let angle = arc.startAngle + arc.sweep * CGFloat(i) / CGFloat(pieceCount)
+            let pos = i == 0 ? a : (i == pieceCount ? b : pointOnCircle(angle))
+            let tangent = ccwTangent(at: pos, center: arc.center)
+            var vertex = PolygonVertex(anchor: CGPoint(x: pos.x / w, y: pos.y / h), controlIn: nil, controlOut: nil)
+            if i > 0 {
+                let inCtl = CGPoint(x: pos.x - dist * tangent.x, y: pos.y - dist * tangent.y)
+                vertex.controlIn = CGPoint(x: inCtl.x / w, y: inCtl.y / h)
+            }
+            if i < pieceCount {
+                let outCtl = CGPoint(x: pos.x + dist * tangent.x, y: pos.y + dist * tangent.y)
+                vertex.controlOut = CGPoint(x: outCtl.x / w, y: outCtl.y / h)
+            }
+            pieceAnchors.append(vertex)
+        }
+
+        copy[index].controlOut = pieceAnchors[0].controlOut
+        copy[next].controlIn = pieceAnchors[pieceCount].controlIn
+        if pieceCount > 1 {
+            copy.insert(contentsOf: pieceAnchors[1..<pieceCount], at: index + 1)
+        }
+        polygonVertices = copy
+    }
+
+    /// Inserts a new anchor on the segment starting at `segmentIndex`, at the point
+    /// on the curve nearest `point`. Uses a De Casteljau split so the curve's shape
+    /// is unchanged — it just gains a draggable point to refine that spot.
+    func insertVertexOnSegment(_ segmentIndex: Int, at point: CGPoint) {
+        guard !isPolygonClosed else { return }
+        let count = polygonVertices.count
+        guard count >= 2, segmentIndex >= 0, segmentIndex < count else { return }
+        let next = (segmentIndex + 1) % count
+        var verts = polygonVertices
+        let start = verts[segmentIndex]
+        let end = verts[next]
+        let a = start.anchor
+        let b = end.anchor
+        let c1 = start.controlOut ?? a
+        let c2 = end.controlIn ?? b
+        let wasCurved = start.controlOut != nil || end.controlIn != nil
+
+        func cubic(_ t: CGFloat) -> CGPoint {
+            let mt = 1 - t
+            return CGPoint(
+                x: mt * mt * mt * a.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * b.x,
+                y: mt * mt * mt * a.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * b.y
+            )
+        }
+        // Nearest parameter to the clicked point.
+        var bestT: CGFloat = 0.5
+        var bestD = CGFloat.greatestFiniteMagnitude
+        let samples = 48
+        for i in 0...samples {
+            let t = CGFloat(i) / CGFloat(samples)
+            let p = cubic(t)
+            let d = hypot(p.x - point.x, p.y - point.y)
+            if d < bestD { bestD = d; bestT = t }
+        }
+        let t = bestT
+
+        func lerp(_ p: CGPoint, _ q: CGPoint, _ tt: CGFloat) -> CGPoint {
+            CGPoint(x: p.x + (q.x - p.x) * tt, y: p.y + (q.y - p.y) * tt)
+        }
+        let p01 = lerp(a, c1, t)
+        let p12 = lerp(c1, c2, t)
+        let p23 = lerp(c2, b, t)
+        let p012 = lerp(p01, p12, t)
+        let p123 = lerp(p12, p23, t)
+        let splitPoint = lerp(p012, p123, t)
+
+        vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
+        vertexRedoStack.removeAll()
+        verts[segmentIndex].controlOut = wasCurved ? p01 : nil
+        verts[next].controlIn = wasCurved ? p23 : nil
+        let inserted = PolygonVertex(
+            anchor: splitPoint,
+            controlIn: wasCurved ? p012 : nil,
+            controlOut: wasCurved ? p123 : nil
+        )
+        verts.insert(inserted, at: segmentIndex + 1)
+        polygonVertices = verts
+        if penSmooth { recomputeSmoothHandles() }
     }
 
     func removeLastVertex() {
         guard !polygonVertices.isEmpty else { return }
-        vertexUndoStack.append(polygonVertices)
+        vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
         vertexRedoStack.removeAll()
         polygonVertices.removeLast()
+        if penSmooth { recomputeSmoothHandles() }
     }
 
     func runMagicWand(at point: CGPoint, additive: Bool) {
@@ -1351,7 +1624,14 @@ final class EditorViewModel: ObservableObject {
             return
         }
         let verts = polygonVertices
+        pendingPolygonHistoryEntry = PendingPolygonState(
+            vertices: polygonVertices,
+            isClosed: isPolygonClosed,
+            undoStack: vertexUndoStack,
+            redoStack: vertexRedoStack
+        )
         polygonVertices.removeAll()
+        isPolygonClosed = false
         vertexUndoStack.removeAll()
         vertexRedoStack.removeAll()
         guard hasLoadedImage else { return }
@@ -1380,8 +1660,49 @@ final class EditorViewModel: ObservableObject {
 
     func cancelPolygon() {
         polygonVertices.removeAll()
+        isPolygonClosed = false
         vertexUndoStack.removeAll()
         vertexRedoStack.removeAll()
+    }
+
+    /// Inverse of `completePolygon()`: keeps everything **inside** the pen
+    /// selection and makes all pixels outside transparent. The crop rectangle
+    /// is then fitted to the bounding box of the kept region.
+    func keepInsidePolygon() {
+        guard polygonVertices.count >= 3 else {
+            cancelPolygon()
+            return
+        }
+        let verts = polygonVertices
+        pendingPolygonHistoryEntry = PendingPolygonState(
+            vertices: polygonVertices,
+            isClosed: isPolygonClosed,
+            undoStack: vertexUndoStack,
+            redoStack: vertexRedoStack
+        )
+        polygonVertices.removeAll()
+        isPolygonClosed = false
+        vertexUndoStack.removeAll()
+        vertexRedoStack.removeAll()
+        guard hasLoadedImage else { return }
+        let feather = eraseFeather
+
+        runEdit(completion: { ok in
+            guard ok else { return }
+        }) { base in
+            let keepMask = try ImagePipeline.rasterizeKeepMask(
+                width: base.width,
+                height: base.height,
+                polygons: [verts],
+                feather: feather
+            )
+            let result = try ImagePipeline.applyKeepMask(
+                cgImage: base,
+                keepMask: keepMask,
+                feather: 0 // feather already baked into the mask
+            )
+            return result
+        }
     }
 
     /// Cuts a clean rectangle or ellipse defined by a normalized bounding rect —
@@ -1454,9 +1775,11 @@ final class EditorViewModel: ObservableObject {
     }
 
     func undo() {
-        if isDrawingPolygon && !vertexUndoStack.isEmpty {
-            vertexRedoStack.append(polygonVertices)
-            polygonVertices = vertexUndoStack.removeLast()
+        if (isDrawingPolygon || isPolygonClosed) && !vertexUndoStack.isEmpty {
+            let previous = vertexUndoStack.removeLast()
+            vertexRedoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
+            polygonVertices = previous.vertices
+            isPolygonClosed = previous.isClosed
             return
         }
         if canUndoShapeMask {
@@ -1464,15 +1787,45 @@ final class EditorViewModel: ObservableObject {
             return
         }
         guard inFlightEdits == 0, !imageUndoStack.isEmpty else { return }
-        imageRedoStack.append(erasedCGImage)
-        erasedCGImage = imageUndoStack.removeLast()
+        
+        let redoEntry = ImageHistoryEntry(
+            image: erasedCGImage,
+            polygonVertices: polygonVertices,
+            isPolygonClosed: isPolygonClosed,
+            vertexUndoStack: vertexUndoStack,
+            vertexRedoStack: vertexRedoStack,
+            editToolTag: currentEditTool,
+            isSliceMode: isSliceMode
+        )
+        imageRedoStack.append(redoEntry)
+        
+        let undoEntry = imageUndoStack.removeLast()
+        erasedCGImage = undoEntry.image
+        
+        // Restore tool selection directly
+        let tag = undoEntry.editToolTag
+        isEraseMode = (tag == 1)
+        isPolygonMode = (tag == 2)
+        isWandMode = (tag == 3)
+        isRestoreMode = (tag == 4)
+        isSliceMode = undoEntry.isSliceMode
+        isShapeRefineMode = false
+        
+        // Restore polygon state
+        polygonVertices = undoEntry.polygonVertices
+        isPolygonClosed = undoEntry.isPolygonClosed
+        vertexUndoStack = undoEntry.vertexUndoStack
+        vertexRedoStack = undoEntry.vertexRedoStack
+        
         afterHistoryChange()
     }
 
     func redo() {
-        if isDrawingPolygon && !vertexRedoStack.isEmpty {
-            vertexUndoStack.append(polygonVertices)
-            polygonVertices = vertexRedoStack.removeLast()
+        if (isDrawingPolygon || isPolygonClosed) && !vertexRedoStack.isEmpty {
+            let next = vertexRedoStack.removeLast()
+            vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
+            polygonVertices = next.vertices
+            isPolygonClosed = next.isClosed
             return
         }
         if canRedoShapeMask {
@@ -1480,8 +1833,36 @@ final class EditorViewModel: ObservableObject {
             return
         }
         guard inFlightEdits == 0, !imageRedoStack.isEmpty else { return }
-        imageUndoStack.append(erasedCGImage)
-        erasedCGImage = imageRedoStack.removeLast()
+        
+        let undoEntry = ImageHistoryEntry(
+            image: erasedCGImage,
+            polygonVertices: polygonVertices,
+            isPolygonClosed: isPolygonClosed,
+            vertexUndoStack: vertexUndoStack,
+            vertexRedoStack: vertexRedoStack,
+            editToolTag: currentEditTool,
+            isSliceMode: isSliceMode
+        )
+        imageUndoStack.append(undoEntry)
+        
+        let redoEntry = imageRedoStack.removeLast()
+        erasedCGImage = redoEntry.image
+        
+        // Restore tool selection directly
+        let tag = redoEntry.editToolTag
+        isEraseMode = (tag == 1)
+        isPolygonMode = (tag == 2)
+        isWandMode = (tag == 3)
+        isRestoreMode = (tag == 4)
+        isSliceMode = redoEntry.isSliceMode
+        isShapeRefineMode = false
+        
+        // Restore polygon state
+        polygonVertices = redoEntry.polygonVertices
+        isPolygonClosed = redoEntry.isPolygonClosed
+        vertexUndoStack = redoEntry.vertexUndoStack
+        vertexRedoStack = redoEntry.vertexRedoStack
+        
         afterHistoryChange()
     }
 
@@ -1546,7 +1927,18 @@ final class EditorViewModel: ObservableObject {
     // MARK: - History helpers
 
     private func pushHistory() {
-        imageUndoStack.append(erasedCGImage)
+        let entry = ImageHistoryEntry(
+            image: erasedCGImage,
+            polygonVertices: pendingPolygonHistoryEntry?.vertices ?? [],
+            isPolygonClosed: pendingPolygonHistoryEntry?.isClosed ?? false,
+            vertexUndoStack: pendingPolygonHistoryEntry?.undoStack ?? [],
+            vertexRedoStack: pendingPolygonHistoryEntry?.redoStack ?? [],
+            editToolTag: currentEditTool,
+            isSliceMode: isSliceMode
+        )
+        pendingPolygonHistoryEntry = nil
+        
+        imageUndoStack.append(entry)
         if imageUndoStack.count > maxHistory {
             imageUndoStack.removeFirst()
         }

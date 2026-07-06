@@ -37,6 +37,9 @@ struct CropCanvasView: View {
     let onPolygonCancel: () -> Void
     let onMoveVertex: (Int, CGPoint) -> Void
     let onCurveSegment: (Int, CGPoint) -> Void
+    let onFinalizeCurveSegment: (Int, CGPoint) -> Void
+    let onInsertVertex: (Int, CGPoint) -> Void
+    let penSmooth: Bool
     let isWandMode: Bool
     let wandContourPath: CGPath?
     let onWandClick: (CGPoint, Bool) -> Void
@@ -1275,8 +1278,10 @@ struct CropCanvasView: View {
                 case .anchor(let i):
                     onMoveVertex(i, currentNorm)
                 case .segment(let i):
-                    // Drag the line between two dots to bend it through the cursor.
-                    onCurveSegment(i, currentNorm)
+                    // Manual arc-drag only in non-smooth mode (smooth auto-curves).
+                    if !penSmooth {
+                        onCurveSegment(i, currentNorm)
+                    }
                 case .pendingAnchor, .none:
                     break
                 }
@@ -1289,6 +1294,16 @@ struct CropCanvasView: View {
                 guard imageFrame.contains(value.startLocation) else { return }
                 let startPoint = clamped(point: value.startLocation, inside: imageFrame)
 
+                // A segment was actually dragged (not just tapped): commit the exact
+                // circular arc now — cheap live preview during the drag, exact
+                // multi-piece fit on release (see finalizeCurveSegment).
+                if penDragMoved, case .segment(let i) = penDrag {
+                    let releasePoint = clamped(point: value.location, inside: imageFrame)
+                    let releaseNorm = normalizedPoint(from: releasePoint, in: imageFrame)
+                    onFinalizeCurveSegment(i, releaseNorm)
+                    return
+                }
+
                 guard !penDragMoved else { return }
 
                 // A plain tap: on the first dot it closes the path; on empty space it
@@ -1296,6 +1311,10 @@ struct CropCanvasView: View {
                 switch penDrag {
                 case .anchor(0) where polygonVertices.count >= 3:
                     onPolygonComplete()
+                case .segment(let i):
+                    // A tap on the line adds a refinement point there (drag curves it).
+                    let norm = normalizedPoint(from: startPoint, in: imageFrame)
+                    onInsertVertex(i, norm)
                 case .pendingAnchor:
                     let norm = normalizedPoint(from: startPoint, in: imageFrame)
                     onPolygonVertex(PolygonVertex(anchor: norm, controlIn: nil, controlOut: nil))
@@ -1400,8 +1419,8 @@ struct CropCanvasView: View {
         }
 
         // "Drag to curve" affordance: a small hollow dot at the middle of each
-        // segment. Grab anywhere along the line between two dots to bend it.
-        if verts.count >= 2 {
+        // segment. Only shown in manual mode (smooth mode auto-curves).
+        if verts.count >= 2 && !penSmooth {
             ForEach(0..<verts.count, id: \.self) { i in
                 let next = (i + 1) % verts.count
                 if !(next == 0 && verts.count < 3) {

@@ -30,11 +30,14 @@ struct RootView: View {
                         onEraseShape: { viewModel.eraseShapeRegion(rect: $0, ellipse: $1) },
                         polygonVertices: viewModel.polygonVertices,
                         onPolygonVertex: { viewModel.addPolygonVertex($0) },
-                        onPolygonComplete: { viewModel.completePolygon() },
+                        onPolygonComplete: { viewModel.closePolygonPath() },
                         onPolygonRemoveLast: { viewModel.removeLastVertex() },
                         onPolygonCancel: { viewModel.cancelPolygon() },
                         onMoveVertex: { viewModel.moveVertex(at: $0, to: $1) },
                         onCurveSegment: { viewModel.curveSegment(at: $0, through: $1) },
+                        onFinalizeCurveSegment: { viewModel.finalizeCurveSegment(at: $0, through: $1) },
+                        onInsertVertex: { viewModel.insertVertexOnSegment($0, at: $1) },
+                        penSmooth: viewModel.penSmooth,
                         isWandMode: viewModel.isWandMode,
                         wandContourPath: viewModel.wandContourPath,
                         onWandClick: { viewModel.runMagicWand(at: $0, additive: $1) },
@@ -538,8 +541,72 @@ struct RootView: View {
                                 .labelsHidden()
 
                                 if viewModel.penShape == .free {
-                                    if viewModel.isDrawingPolygon {
-                                        Text("\(viewModel.polygonVertices.count) pts — drag the line between dots to curve it")
+                                    Toggle("Smooth curve", isOn: Binding(
+                                        get: { viewModel.penSmooth },
+                                        set: { viewModel.setPenSmooth($0) }
+                                    ))
+                                    .toggleStyle(.switch)
+                                    .font(.caption)
+                                    .disabled(viewModel.isPolygonClosed)
+
+                                    if viewModel.isPolygonAwaitingAction {
+                                        // ── Phase 2: Path closed, pick an action ──
+                                        Text("\(viewModel.polygonVertices.count) pts — path closed")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+
+                                        Text("Choose an action for the selection:")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+
+                                        VStack(spacing: 6) {
+                                            Button {
+                                                viewModel.completePolygon()
+                                            } label: {
+                                                Label("Erase Inside", systemImage: "eraser")
+                                                    .frame(maxWidth: .infinity)
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                            .tint(.red.opacity(0.8))
+                                            .font(.caption)
+                                            .help("Remove everything inside the selection")
+
+                                            Button {
+                                                viewModel.keepInsidePolygon()
+                                            } label: {
+                                                Label("Keep Inside", systemImage: "scissors")
+                                                    .frame(maxWidth: .infinity)
+                                            }
+                                            .buttonStyle(.borderedProminent)
+                                            .tint(.teal)
+                                            .font(.caption)
+                                            .help("Keep the inside, erase everything outside")
+
+                                            HStack(spacing: 8) {
+                                                Button {
+                                                    viewModel.isPolygonClosed = false
+                                                } label: {
+                                                    Label("Reopen", systemImage: "arrow.uturn.backward")
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .font(.caption)
+                                                .help("Reopen the path to keep editing vertices")
+
+                                                Button(role: .destructive) {
+                                                    viewModel.cancelPolygon()
+                                                } label: {
+                                                    Label("Cancel", systemImage: "xmark")
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .font(.caption)
+                                            }
+                                        }
+
+                                    } else if viewModel.isDrawingPolygon {
+                                        // ── Phase 1: Drawing points ──
+                                        Text(viewModel.penSmooth
+                                            ? "\(viewModel.polygonVertices.count) pts — placing points auto-smooths the curve; tap a line to add a point"
+                                            : "\(viewModel.polygonVertices.count) pts — drag the line to curve (arc); tap the line to add a point")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
 
@@ -549,12 +616,14 @@ struct RootView: View {
 
                                         HStack(spacing: 8) {
                                             Button {
-                                                viewModel.completePolygon()
+                                                viewModel.closePolygonPath()
                                             } label: {
-                                                Label("Complete", systemImage: "checkmark")
+                                                Label("Close Path", systemImage: "checkmark")
                                             }
                                             .buttonStyle(.borderedProminent)
                                             .font(.caption)
+                                            .disabled(viewModel.polygonVertices.count < 3)
+                                            .help("Close the path, then choose an action")
 
                                             Button(role: .destructive) {
                                                 viewModel.cancelPolygon()
@@ -565,7 +634,9 @@ struct RootView: View {
                                             .font(.caption)
                                         }
                                     } else {
-                                        Text("Click to place dots; then drag the line between dots to curve")
+                                        Text(viewModel.penSmooth
+                                            ? "Click points around the shape — the curve auto-smooths through them"
+                                            : "Click to place dots; then drag the line between dots to curve")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
