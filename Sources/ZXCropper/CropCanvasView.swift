@@ -882,8 +882,12 @@ struct CropCanvasView: View {
             return CGRect(origin: .zero, size: containerSize)
         }
 
-        let widthScale = containerSize.width / imageSize.width
-        let heightScale = containerSize.height / imageSize.height
+        let padding: CGFloat = 24
+        let targetWidth = max(containerSize.width - padding * 2, 10)
+        let targetHeight = max(containerSize.height - padding * 2, 10)
+
+        let widthScale = targetWidth / imageSize.width
+        let heightScale = targetHeight / imageSize.height
         let scale = min(widthScale, heightScale)
 
         let size = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)

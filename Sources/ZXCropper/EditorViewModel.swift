@@ -40,7 +40,7 @@ final class EditorViewModel: ObservableObject {
     @Published var sourceImage: NSImage?
     @Published var originalImage: NSImage?
     @Published var previewImage: NSImage?
-    @Published var cropRectNormalized: CGRect = CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+    @Published var cropRectNormalized: CGRect = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
     @Published var selectedAspectPreset: AspectPreset = .free
     @Published var resizeWidth: String = ""
     @Published var resizeHeight: String = ""
@@ -317,7 +317,7 @@ final class EditorViewModel: ObservableObject {
     }
 
     func resetCrop() {
-        cropRectNormalized = CGRect(x: 0.05, y: 0.05, width: 0.9, height: 0.9)
+        cropRectNormalized = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
 
         if autoSizeToCrop {
             applyResizeToCurrentCrop()
@@ -2069,7 +2069,7 @@ final class EditorViewModel: ObservableObject {
                     self.erasedCGImage = nil
                     self.syncPipeline(to: nil)
                     self.inFlightEdits = 0
-                    self.cropRectNormalized = CGRect(x: 0.05, y: 0.05, width: 0.9, height: 0.9)
+                    self.cropRectNormalized = CGRect(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
                     self.autoSizeToCrop = true
                     self.needsPersistentFolderAccess = false
                     self.pendingImageURLForAccess = nil
