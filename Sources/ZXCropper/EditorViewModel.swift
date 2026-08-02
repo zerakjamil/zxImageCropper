@@ -110,26 +110,16 @@ final class EditorViewModel: ObservableObject {
     /// Shape overlays aligned 1:1 with `detectedRemovedSpots`.
     private(set) var removedSpotShapes: [NSImage?] = []
     @Published var removedSpotMinSize: String = "16"
-    // Smart Cutout: detect the main shape, preview it in red, refine it, then cut
-    // everything around it away onto a transparent background.
+    /// When true, Detect Removed Spots also identifies edge shadows, outlines, line details, and cavities.
+    @Published var removedSpotIncludeEdges = true
+    // Auto Pen Path Cutout: detect every part of the subject as editable pen paths,
+    // then cycle through the parts (or the full combined outline) and cut.
     @Published var isDetectingShape = false
     @Published var shapeTolerance: CGFloat = 60
-    @Published var shapeEdgeFeather: CGFloat = 2
-    @Published var shapeKeepLargest = true
-    /// Auto-run Detect Shape whenever a new image is opened.
-    @Published var autoDetectShapeOnOpen = true
-    /// Refine brush active — paint to add to / remove from the red selection.
-    @Published var isShapeRefineMode = false
-    /// Refine brush mode: true paints the shape in (include), false paints it out.
-    @Published var shapeRefineAdd = false
-    /// Full-size red-overlay source (white subject on transparent bg) shown in the
-    /// canvas while a shape detection is active. Nil when there's no detection.
-    @Published var shapeOverlayImage: NSImage?
-    /// The editable full-size keep mask (255 = subject). Source of truth for the
-    /// overlay and for Extract; mutated by expand/shrink and the refine brush.
-    private var shapeWorkingMask: CGImage?
-    private var shapeMaskUndoStack: [CGImage] = []
-    private var shapeMaskRedoStack: [CGImage] = []
+    /// Detected candidate paths. Candidate 0 is the combined full-logo outline;
+    /// the rest are individual parts, largest first.
+    @Published var pathCandidates: [[PolygonVertex]] = []
+    @Published var currentCandidateIndex: Int = 0
     @Published var isSpriteBoxEditMode = false
     /// Number of bake operations currently in flight. Gates undo/redo/save so the
     /// snapshot history can't be mutated underneath an outstanding bake.
@@ -176,13 +166,14 @@ final class EditorViewModel: ObservableObject {
 
     var canUndo: Bool {
         ((isDrawingPolygon || isPolygonClosed) && !vertexUndoStack.isEmpty)
-            || canUndoShapeMask
             || (inFlightEdits == 0 && !imageUndoStack.isEmpty)
     }
 
     var canRedo: Bool {
-        ((isDrawingPolygon || isPolygonClosed) && !vertexRedoStack.isEmpty)
-            || canRedoShapeMask
+        // Undoing a freshly detected pen path leaves an empty polygon (isDrawing /
+        // isClosed both false) with the path still on the redo stack — the flag must
+        // not gate on polygon state.
+        !vertexRedoStack.isEmpty
             || (inFlightEdits == 0 && !imageRedoStack.isEmpty)
     }
 
@@ -625,6 +616,10 @@ final class EditorViewModel: ObservableObject {
         removedSpotMinSize = value.filter(\.isNumber)
     }
 
+    func setRemovedSpotIncludeEdges(_ enabled: Bool) {
+        removedSpotIncludeEdges = enabled
+    }
+
     var resolvedRemovedSpotMinSize: Int {
         max(1, Int(removedSpotMinSize) ?? 16)
     }
@@ -633,6 +628,7 @@ final class EditorViewModel: ObservableObject {
         guard let loadedImage, let base = currentBaseImage() else { return }
         let original = loadedImage.cgImage
         let minSize = resolvedRemovedSpotMinSize
+        let includeEdges = removedSpotIncludeEdges
 
         isDetectingRemovedSpots = true
         errorMessage = nil
@@ -644,15 +640,18 @@ final class EditorViewModel: ObservableObject {
                 let spots = try ImagePipeline.detectRemovedSpots(
                     processed: base,
                     original: original,
-                    minSize: minSize
+                    minSize: minSize,
+                    includeEdgeDetails: includeEdges
                 )
                 DispatchQueue.main.async {
                     self.detectedRemovedSpots = spots
                     self.isDetectingRemovedSpots = false
                     if spots.isEmpty {
-                        self.infoMessage = "No enclosed removed areas found. Use the Restore brush for edge-connected areas."
+                        self.infoMessage = includeEdges
+                            ? "No removed areas or edge shadows detected."
+                            : "No enclosed removed areas found."
                     } else {
-                        self.infoMessage = "Found \(spots.count) removed area\(spots.count == 1 ? "" : "s"). Click any to restore."
+                        self.infoMessage = "Found \(spots.count) removed area\(spots.count == 1 ? "" : "s"). Click any to restore\(spots.count > 1 ? ", or Restore All" : "")."
                     }
                 }
             } catch {
@@ -666,6 +665,34 @@ final class EditorViewModel: ObservableObject {
 
     func clearRemovedSpots() {
         detectedRemovedSpots = []
+    }
+
+    func restoreAllRemovedSpots() {
+        guard !isSaving, inFlightEdits == 0, hasLoadedImage else { return }
+        guard let loadedImage else { return }
+        let masks = detectedRemovedSpots.map { $0.mask }
+        guard !masks.isEmpty else { return }
+        let count = masks.count
+        let original = loadedImage.cgImage
+
+        isSaving = true
+        errorMessage = nil
+        infoMessage = "Restoring \(count) area\(count == 1 ? "" : "s")..."
+
+        runEdit(completion: { [weak self] ok in
+            self?.isSaving = false
+            if ok {
+                self?.detectedRemovedSpots = []
+                self?.infoMessage = "Restored \(count) area\(count == 1 ? "" : "s")."
+            }
+        }) { base in
+            guard let combined = ImagePipeline.combineMasks(masks) else { return base }
+            return try ImagePipeline.restore(
+                base: base, original: original,
+                strokes: [], polygons: [],
+                brushSize: 1, selectionMask: combined
+            )
+        }
     }
 
     func restoreRemovedSpot(at index: Int) {
@@ -702,185 +729,99 @@ final class EditorViewModel: ObservableObject {
         normalizedBoxes(for: detectedRemovedSpots)
     }
 
-    // MARK: - Smart Cutout (detect shape → refine → extract)
+    // MARK: - Auto Pen Path Cutout (detect parts → cycle → cut)
 
-    var hasShapeDetection: Bool {
-        shapeWorkingMask != nil
-    }
-
-    func setShapeKeepLargest(_ enabled: Bool) {
-        shapeKeepLargest = enabled
-        if hasShapeDetection { scheduleShapeDetection() }
-    }
-
-    /// Runs a full-resolution detection and shows the red overlay.
-    func detectShape() {
+    /// Detects every connected subject part as an editable pen path. Candidate 0 is
+    /// the combined full-logo outline; the rest are individual parts, largest
+    /// first. Drops the editor straight into pen mode with candidate 0 selected and
+    /// the path closed and awaiting a cut action. The generated path lands on the
+    /// vertex undo stack, so ⌘Z removes it.
+    func detectPenPathCandidates() {
         guard hasLoadedImage else { return }
         guard !isSaving, !isRunningLumaKey, !isRunningShellAction, inFlightEdits == 0 else { return }
+        // Snapshot the base on the main thread; a new undo / edit / detection bumps
+        // the generation and invalidates this run, so a stale outline can never
+        // clobber newer state.
+        guard let base = currentBaseImage() else { return }
+        let tolerance = shapeTolerance
         isDetectingShape = true
         errorMessage = nil
-        infoMessage = "Detecting shape..."
-        shapeDetectionGeneration += 1
-        performDetection(generation: shapeDetectionGeneration)
-    }
-
-    /// Debounced re-detection used when tolerance / keep-largest change while a
-    /// detection is already on screen. A fresh detection replaces the working mask
-    /// and clears refine history (tolerance is a from-scratch decision).
-    func scheduleShapeDetection() {
-        guard hasShapeDetection, hasLoadedImage else { return }
+        infoMessage = "Detecting pen paths..."
         shapeDetectionGeneration += 1
         let generation = shapeDetectionGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            guard let self, generation == self.shapeDetectionGeneration else { return }
-            self.isDetectingShape = true
-            self.performDetection(generation: generation)
-        }
-    }
-
-    private func performDetection(generation: Int) {
-        guard let base = currentBaseImage() else { isDetectingShape = false; return }
-        let tolerance = shapeTolerance
-        let keepLargest = shapeKeepLargest
-        let pixels = base.width * base.height
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let detection = try? ImagePipeline.detectForegroundShape(
-                cgImage: base, tolerance: tolerance, keepLargest: keepLargest
-            )
+            let set = ImagePipeline.detectPenPathSet(cgImage: base, tolerance: tolerance)
             DispatchQueue.main.async {
                 guard generation == self.shapeDetectionGeneration else { return }
                 self.isDetectingShape = false
-                self.shapeMaskUndoStack.removeAll()
-                self.shapeMaskRedoStack.removeAll()
-                guard let detection, detection.pixelCount > 0 else {
-                    self.shapeWorkingMask = nil
-                    self.shapeOverlayImage = nil
-                    self.isShapeRefineMode = false
-                    self.infoMessage = "No shape found — lower the tolerance and try again."
+                guard let set, !set.componentPaths.isEmpty else {
+                    self.errorMessage = "Could not detect a subject outline. Try a clearer image or adjust the tolerance."
                     return
                 }
-                self.setWorkingMask(detection.mask)
-                let coverage = Double(detection.pixelCount) / Double(max(1, pixels))
-                self.infoMessage = coverage > 0.985
-                    ? "Almost everything is selected — raise the tolerance to separate the shape from its background."
-                    : "Shape detected (red). Expand/Shrink or Refine the selection, then Extract & Crop."
+                // A single part's combined outline IS that part, so dedup it —
+                // otherwise the nav shows a fake "Shape 1 of 2 / Shape 2 of 2".
+                let candidates = [set.combinedOuterPath] + set.componentPaths.filter { $0 != set.combinedOuterPath }
+                guard candidates.first?.count ?? 0 >= 3 else {
+                    self.errorMessage = "The detected outlines were too small to use as pen paths."
+                    return
+                }
+                self.pathCandidates = candidates
+                self.currentCandidateIndex = 0
+                self.selectEditTool(2)
+                self.penShape = .free
+                // Record the pre-detect path (normally empty) so ⌘Z removes the
+                // generated path; redo restores it.
+                self.vertexUndoStack.append(
+                    PolygonHistoryEntry(vertices: self.polygonVertices, isClosed: self.isPolygonClosed)
+                )
+                self.vertexRedoStack.removeAll()
+                self.polygonVertices = candidates[0]
+                self.isPolygonClosed = true
+                if self.penSmooth { self.recomputeSmoothHandles() }
+                self.infoMessage = candidates.count > 1
+                    ? "Outline ready — ◄ Prev / Next ► to pick a part, or drag dots to refine, then cut."
+                    : "Outline ready — drag dots or lines to refine, then Erase Inside or Keep Inside."
             }
         }
     }
 
-    /// Updates the working mask and rebuilds the red overlay from it.
-    private func setWorkingMask(_ mask: CGImage) {
-        shapeWorkingMask = mask
-        shapeOverlayImage = ImagePipeline.keepMaskOverlay(mask).map {
-            NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height))
-        }
+    func cycleNextCandidate() {
+        guard !pathCandidates.isEmpty else { return }
+        currentCandidateIndex = (currentCandidateIndex + 1) % pathCandidates.count
+        applyCandidate()
     }
 
-    private func pushShapeMaskHistory() {
-        guard let mask = shapeWorkingMask else { return }
-        shapeMaskUndoStack.append(mask)
-        if shapeMaskUndoStack.count > maxHistory { shapeMaskUndoStack.removeFirst() }
-        shapeMaskRedoStack.removeAll()
+    func cyclePrevCandidate() {
+        guard !pathCandidates.isEmpty else { return }
+        currentCandidateIndex = (currentCandidateIndex - 1 + pathCandidates.count) % pathCandidates.count
+        applyCandidate()
     }
 
-    /// Per-image expand/shrink step in pixels (~0.4% of the short edge, min 2px).
-    private var shapeMorphStep: Int {
-        guard let mask = shapeWorkingMask else { return 3 }
-        return max(2, Int((CGFloat(min(mask.width, mask.height)) * 0.004).rounded()))
+    /// Jump back to candidate 0, the combined full-logo outline.
+    func selectCombinedOuterPath() {
+        guard !pathCandidates.isEmpty else { return }
+        currentCandidateIndex = 0
+        applyCandidate()
     }
 
-    func expandShape() { morphWorkingMask(by: shapeMorphStep, label: "Expanded selection.") }
-    func shrinkShape() { morphWorkingMask(by: -shapeMorphStep, label: "Shrank selection.") }
-
-    private func morphWorkingMask(by radius: Int, label: String) {
-        guard let mask = shapeWorkingMask,
-              let result = ImagePipeline.morphMask(mask, radius: radius) else { return }
-        pushShapeMaskHistory()
-        setWorkingMask(result)
-        infoMessage = label
-    }
-
-    func setShapeRefineMode(_ on: Bool) {
-        isShapeRefineMode = on
-        if on {
-            isEraseMode = false
-            isPolygonMode = false
-            isWandMode = false
-            isRestoreMode = false
-            isSliceMode = false
-            cancelPolygon()
-            clearWandSelection()
-            clearLumaPreview()
-        }
-    }
-
-    /// Paints one refine stroke into the working mask (add or remove).
-    private func applyShapeRefineStroke(_ stroke: [CGPoint]) {
-        guard let mask = shapeWorkingMask, !stroke.isEmpty else { return }
-        guard let result = try? ImagePipeline.paintShapeMask(
-            mask: mask, stroke: stroke,
-            brushSize: eraseBrushSize, brushShape: brushShape,
-            brushHardness: eraseBrushHardness, add: shapeRefineAdd
-        ) else { return }
-        pushShapeMaskHistory()
-        setWorkingMask(result)
-    }
-
-    var canUndoShapeMask: Bool { hasShapeDetection && !shapeMaskUndoStack.isEmpty }
-    var canRedoShapeMask: Bool { hasShapeDetection && !shapeMaskRedoStack.isEmpty }
-
-    func undoShapeMask() {
-        guard let mask = shapeWorkingMask, !shapeMaskUndoStack.isEmpty else { return }
-        shapeMaskRedoStack.append(mask)
-        setWorkingMask(shapeMaskUndoStack.removeLast())
-    }
-
-    func redoShapeMask() {
-        guard let mask = shapeWorkingMask, !shapeMaskRedoStack.isEmpty else { return }
-        shapeMaskUndoStack.append(mask)
-        setWorkingMask(shapeMaskRedoStack.removeLast())
-    }
-
-    /// Bakes the cutout: keeps the refined selection and makes everything else
-    /// transparent, then fits the crop box to the shape.
-    func extractShape() {
-        guard let mask = shapeWorkingMask, hasLoadedImage else { return }
-        guard !isSaving, !isRunningLumaKey, !isRunningShellAction, inFlightEdits == 0 else { return }
-
-        let box = ImagePipeline.maskBoundingBox(mask)
-        guard box.width > 0, box.height > 0 else {
-            errorMessage = "The selection is empty — adjust it and try again."
-            return
-        }
-
-        let feather = shapeEdgeFeather
-        isSaving = true
-        errorMessage = nil
-        infoMessage = "Extracting shape..."
-        isShapeRefineMode = false
-
-        runEdit(completion: { [weak self] ok in
-            guard let self else { return }
-            self.isSaving = false
-            guard ok else { return }
-            self.clearShapeDetection()
-            self.fitCropToPixelBox(box)
-            self.infoMessage = "Shape extracted onto a transparent background."
-        }) { editBase in
-            try ImagePipeline.applyKeepMask(cgImage: editBase, keepMask: mask, feather: feather)
-        }
+    /// Swaps the canvas pen path to the current candidate. Cycled candidates aren't
+    /// pushed on the undo stack — one ⌘Z removes the whole generated path.
+    // ponytail: no per-candidate undo entries; the pre-detect snapshot covers it.
+    private func applyCandidate() {
+        let verts = pathCandidates[currentCandidateIndex]
+        guard !verts.isEmpty else { return }
+        polygonVertices = verts
+        isPolygonClosed = true
+        if penSmooth { recomputeSmoothHandles() }
     }
 
     func clearShapeDetection() {
         shapeDetectionGeneration += 1
         isDetectingShape = false
-        isShapeRefineMode = false
-        shapeWorkingMask = nil
-        shapeMaskUndoStack.removeAll()
-        shapeMaskRedoStack.removeAll()
-        if shapeOverlayImage != nil { shapeOverlayImage = nil }
+        if !pathCandidates.isEmpty { pathCandidates = [] }
+        currentCandidateIndex = 0
     }
 
     /// Sets the crop rectangle to a pixel-space bounding box (top-left origin) with
@@ -948,7 +889,6 @@ final class EditorViewModel: ObservableObject {
         isWandMode = tag == 3
         isRestoreMode = tag == 4
         if tag != 0 { isSliceMode = false }
-        isShapeRefineMode = false
         if tag != 2 { cancelPolygon() }
         if tag != 3 { clearWandSelection() }
         clearLumaPreview()
@@ -983,13 +923,6 @@ final class EditorViewModel: ObservableObject {
         guard !currentEraseStroke.isEmpty else { return }
         let stroke = currentEraseStroke
         currentEraseStroke.removeAll()
-
-        // In Smart Cutout refine mode the brush edits the red selection mask
-        // instead of baking into the image.
-        if isShapeRefineMode {
-            applyShapeRefineStroke(stroke)
-            return
-        }
 
         guard let original = loadedImage?.cgImage else { return }
 
@@ -1037,7 +970,6 @@ final class EditorViewModel: ObservableObject {
             isPolygonMode = false
             isWandMode = false
             isRestoreMode = false
-            isShapeRefineMode = false
             cancelPolygon()
             clearWandSelection()
             clearLumaPreview()
@@ -1473,9 +1405,10 @@ final class EditorViewModel: ObservableObject {
 
     /// Inserts a new anchor on the segment starting at `segmentIndex`, at the point
     /// on the curve nearest `point`. Uses a De Casteljau split so the curve's shape
-    /// is unchanged — it just gains a draggable point to refine that spot.
+    /// is unchanged — it just gains a draggable point to refine that spot. Works on
+    /// closed paths too (the detect-as-pen case), where tapping the midpoint dot of
+    /// a segment must add a vertex.
     func insertVertexOnSegment(_ segmentIndex: Int, at point: CGPoint) {
-        guard !isPolygonClosed else { return }
         let count = polygonVertices.count
         guard count >= 2, segmentIndex >= 0, segmentIndex < count else { return }
         let next = (segmentIndex + 1) % count
@@ -1782,10 +1715,6 @@ final class EditorViewModel: ObservableObject {
             isPolygonClosed = previous.isClosed
             return
         }
-        if canUndoShapeMask {
-            undoShapeMask()
-            return
-        }
         guard inFlightEdits == 0, !imageUndoStack.isEmpty else { return }
         
         let redoEntry = ImageHistoryEntry(
@@ -1809,8 +1738,7 @@ final class EditorViewModel: ObservableObject {
         isWandMode = (tag == 3)
         isRestoreMode = (tag == 4)
         isSliceMode = undoEntry.isSliceMode
-        isShapeRefineMode = false
-        
+
         // Restore polygon state
         polygonVertices = undoEntry.polygonVertices
         isPolygonClosed = undoEntry.isPolygonClosed
@@ -1821,15 +1749,11 @@ final class EditorViewModel: ObservableObject {
     }
 
     func redo() {
-        if (isDrawingPolygon || isPolygonClosed) && !vertexRedoStack.isEmpty {
+        if !vertexRedoStack.isEmpty {
             let next = vertexRedoStack.removeLast()
             vertexUndoStack.append(PolygonHistoryEntry(vertices: polygonVertices, isClosed: isPolygonClosed))
             polygonVertices = next.vertices
             isPolygonClosed = next.isClosed
-            return
-        }
-        if canRedoShapeMask {
-            redoShapeMask()
             return
         }
         guard inFlightEdits == 0, !imageRedoStack.isEmpty else { return }
@@ -1855,8 +1779,7 @@ final class EditorViewModel: ObservableObject {
         isWandMode = (tag == 3)
         isRestoreMode = (tag == 4)
         isSliceMode = redoEntry.isSliceMode
-        isShapeRefineMode = false
-        
+
         // Restore polygon state
         polygonVertices = redoEntry.polygonVertices
         isPolygonClosed = redoEntry.isPolygonClosed
@@ -2077,9 +2000,6 @@ final class EditorViewModel: ObservableObject {
                     self.isRenderingPreview = false
                     self.applyResizeToCurrentCrop()
                     self.clearShapeDetection()
-                    if self.autoDetectShapeOnOpen {
-                        self.detectShape()
-                    }
                 }
             } catch {
                 DispatchQueue.main.async {

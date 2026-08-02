@@ -17,11 +17,11 @@ struct ZXCropperApp: App {
             RootView(viewModel: viewModel)
                 .frame(
                     minWidth: 940,
-                    idealWidth: 980,
-                    maxWidth: 1120,
+                    idealWidth: 1200,
+                    maxWidth: .infinity,
                     minHeight: 660,
-                    idealHeight: 730,
-                    maxHeight: 820
+                    idealHeight: 800,
+                    maxHeight: .infinity
                 )
                 .onAppear {
                     appDelegate.onOpenFile = { [weak viewModel] url in

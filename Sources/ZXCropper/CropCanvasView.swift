@@ -63,9 +63,6 @@ struct CropCanvasView: View {
     let onRemovedSpotClick: (Int) -> Void
     let originalImage: NSImage?
     let livePreviewImage: NSImage?
-    let shapeOverlayImage: NSImage?
-    let isShapeRefineMode: Bool
-    let shapeRefineAdd: Bool
     let pixelSize: CGSize
     let onSelectTool: (Int) -> Void
 
@@ -197,25 +194,7 @@ struct CropCanvasView: View {
                     }
                 }
 
-                // Smart Cutout: the detected shape, tinted red, over the source.
-                // Drawn before the brush stroke so refine strokes stay visible.
-                if !showOriginal, let shapeOverlay = shapeOverlayImage {
-                    Image(nsImage: shapeOverlay)
-                        .resizable()
-                        .interpolation(.medium)
-                        .frame(width: imageFrame.width, height: imageFrame.height)
-                        .position(x: imageFrame.midX, y: imageFrame.midY)
-                        .colorMultiply(.red)
-                        .opacity(0.5)
-                        .allowsHitTesting(false)
-
-                    badge(isShapeRefineMode ? (shapeRefineAdd ? "Refine: Add" : "Refine: Remove") : "Cutout preview",
-                          color: .red.opacity(0.85))
-                        .position(x: imageFrame.minX + 60, y: imageFrame.maxY - 16)
-                        .allowsHitTesting(false)
-                }
-
-                if isEraseMode || isRestoreMode || isShapeRefineMode {
+                if isEraseMode || isRestoreMode {
                     eraseStrokeOverlay(imageFrame: imageFrame)
                 }
 
@@ -468,7 +447,7 @@ struct CropCanvasView: View {
 
                     if isHoldingZ && imageFrame.contains(startPoint) {
                         interaction = .pan(startOffset: panOffset)
-                    } else if (isEraseMode || isRestoreMode || isShapeRefineMode) && imageFrame.contains(startPoint) {
+                    } else if (isEraseMode || isRestoreMode) && imageFrame.contains(startPoint) {
                         let norm = normalizedPoint(from: startPoint, in: imageFrame)
                         onErasePoint(norm)
                         interaction = .erase
@@ -915,7 +894,7 @@ struct CropCanvasView: View {
         let lineJoin: CGLineJoin = eraseBrushShape == .square ? .miter : .round
         let style = StrokeStyle(lineWidth: brushViewSize, lineCap: lineCap, lineJoin: lineJoin)
         // Refine brush is colour-coded: green adds to the selection, red removes.
-        let strokeTint: Color = isShapeRefineMode ? (shapeRefineAdd ? .green : .red) : .red
+        let strokeTint: Color = .red
 
         ForEach(Array(eraseStrokes.enumerated()), id: \.offset) { _, stroke in
             strokePath(stroke, imageFrame: imageFrame)

@@ -176,6 +176,66 @@ final class ShellActionRunnerTests: XCTestCase {
         }
     }
 
+    func testCandidateCyclingWrapsWithoutIndexOutOfBounds() {
+        let vm = EditorViewModel(imagePath: nil)
+        // Three candidates: combined + two parts.
+        func path(_ x: CGFloat) -> [PolygonVertex] {
+            [PolygonVertex(anchor: CGPoint(x: x, y: 0.2), controlIn: nil, controlOut: nil),
+             PolygonVertex(anchor: CGPoint(x: x + 0.1, y: 0.2), controlIn: nil, controlOut: nil),
+             PolygonVertex(anchor: CGPoint(x: x + 0.1, y: 0.3), controlIn: nil, controlOut: nil)]
+        }
+        vm.pathCandidates = [path(0), path(0.4), path(0.7)]
+        vm.currentCandidateIndex = 0
+
+        vm.selectCombinedOuterPath()
+        XCTAssertEqual(vm.currentCandidateIndex, 0, "Full Logo jumps to candidate 0")
+        XCTAssertEqual(vm.polygonVertices, vm.pathCandidates[0])
+        XCTAssertTrue(vm.isPolygonClosed)
+
+        vm.cycleNextCandidate()
+        XCTAssertEqual(vm.currentCandidateIndex, 1)
+        XCTAssertEqual(vm.polygonVertices, vm.pathCandidates[1])
+
+        vm.cycleNextCandidate()
+        XCTAssertEqual(vm.currentCandidateIndex, 2)
+        vm.cycleNextCandidate()
+        XCTAssertEqual(vm.currentCandidateIndex, 0, "Next wraps past the last candidate")
+        XCTAssertEqual(vm.polygonVertices, vm.pathCandidates[0])
+
+        vm.cyclePrevCandidate()
+        XCTAssertEqual(vm.currentCandidateIndex, 2, "Prev wraps back from candidate 0")
+        XCTAssertEqual(vm.polygonVertices, vm.pathCandidates[2])
+
+        // No candidates -> every navigation is a safe no-op (index preserved,
+        // no crash, polygon untouched).
+        vm.pathCandidates = []
+        let before = vm.polygonVertices
+        vm.cycleNextCandidate()
+        vm.cyclePrevCandidate()
+        vm.selectCombinedOuterPath()
+        XCTAssertEqual(vm.polygonVertices, before, "empty candidates must not touch the polygon")
+    }
+
+    func testInsertVertexWorksOnClosedPolygon() {
+        // A detect-as-pen path is closed (isPolygonClosed == true). Tapping a
+        // segment's midpoint dot must still insert a vertex — regression for the
+        // old `guard !isPolygonClosed` that silently swallowed the tap.
+        let vm = EditorViewModel(imagePath: nil)
+        vm.setPenSmooth(false)
+        vm.addPolygonVertex(PolygonVertex(anchor: CGPoint(x: 0.2, y: 0.2), controlIn: nil, controlOut: nil))
+        vm.addPolygonVertex(PolygonVertex(anchor: CGPoint(x: 0.8, y: 0.2), controlIn: nil, controlOut: nil))
+        vm.addPolygonVertex(PolygonVertex(anchor: CGPoint(x: 0.8, y: 0.8), controlIn: nil, controlOut: nil))
+        vm.addPolygonVertex(PolygonVertex(anchor: CGPoint(x: 0.2, y: 0.8), controlIn: nil, controlOut: nil))
+        vm.closePolygonPath()
+        XCTAssertTrue(vm.isPolygonClosed)
+
+        vm.insertVertexOnSegment(0, at: CGPoint(x: 0.5, y: 0.2))
+        XCTAssertEqual(vm.polygonVertices.count, 5, "closed path must accept a new anchor on its segment")
+        XCTAssertTrue(vm.isPolygonClosed, "closing must survive the insert")
+        XCTAssertEqual(vm.polygonVertices[1].anchor.x, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(vm.polygonVertices[1].anchor.y, 0.2, accuracy: 1e-9)
+    }
+
     func testCurveSegmentCollinearStaysStraight() {
         let vm = EditorViewModel(imagePath: nil)
         vm.setPenSmooth(false) // manual arc mode

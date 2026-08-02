@@ -1,6 +1,8 @@
 import AppKit
 import CoreGraphics
+import CoreImage
 import Foundation
+import Vision
 
 /// Result of automatic foreground-shape detection.
 ///
@@ -14,30 +16,50 @@ struct ShapeDetection {
     let pixelCount: Int
 }
 
+/// The subject's detected parts as editable pen paths (normalized 0…1, top-left
+/// origin). `combinedOuterPath` is the full-logo outline that encloses every part;
+/// `componentPaths` are the individual parts ordered largest-first.
+struct DetectedPathSet {
+    let combinedOuterPath: [PolygonVertex]
+    let componentPaths: [[PolygonVertex]]
+}
+
 extension ImagePipeline {
     /// Detects the main foreground shape and returns a mask that keeps the subject
     /// while dropping the surrounding background.
     ///
     /// Algorithm:
     /// 1. Classify every pixel as "background-like": transparent (when the source
-    ///    already carries alpha) or close in colour to the image border. Border
-    ///    colours are sampled into a small quantised palette so smooth gradient
-    ///    backgrounds are still covered — a pixel is background when it is within
-    ///    `tolerance` (weighted colour distance) of *any* palette entry.
+    ///    already carries alpha) or close in CIELAB colour to the image border.
+    ///    Border colours are sampled into a small quantised palette so smooth
+    ///    gradient backgrounds are still covered — a pixel is background when its
+    ///    ΔE76 distance to *any* palette entry is within `deltaEThreshold(tolerance)`.
     /// 2. Flood-fill those background pixels inward from all four borders. Only
-    ///    background connected to the edge becomes "external".
+    ///    background connected to the edge becomes "external". The flood expands in
+    ///    steps (T0, then 1.5·T0, then 2.25·T0 when a `subjectPrior` is present) so a
+    ///    soft vignette gradient that drifts away from the sampled border palette is
+    ///    fully keyed rather than leaving a ring of "almost background" pixels.
     /// 3. The subject is everything the flood could NOT reach. This automatically
     ///    fills holes enclosed by the shape (e.g. a dark pocket inside the asset).
+    ///    A `subjectPrior` is an impassable wall: its pixels are never background,
+    ///    never seeded, never enqueued, so they are always kept — the flood result
+    ///    is implicitly the union of the prior and the keyed subject.
     /// 4. Optionally keep only the largest connected blob, dropping stray specks.
     ///
     /// - Parameters:
-    ///   - tolerance: weighted colour-distance radius for "background-like". Larger
-    ///     values eat more of a soft halo/glow; smaller values keep more of it.
+    ///   - tolerance: colour-distance radius for "background-like". Larger values
+    ///     eat more of a soft halo/glow; smaller values keep more of it.
     ///   - keepLargest: keep only the single biggest subject component.
+    ///   - subjectPrior: optional keep-mask (255 = subject) whose pixels are
+    ///     protected from keying. Used to keep dark clothing/weapons that match a
+    ///     dark background.
+    /// - Throws: `PipelineError.renderFailed` when no background palette survives
+    ///   or the kept fraction would be ≥ 99% (near-full frame — never a cutout).
     static func detectForegroundShape(
         cgImage: CGImage,
         tolerance: CGFloat,
-        keepLargest: Bool = true
+        keepLargest: Bool = true,
+        subjectPrior: CGImage? = nil
     ) throws -> ShapeDetection {
         let width = cgImage.width
         let height = cgImage.height
@@ -87,18 +109,28 @@ extension ImagePipeline {
             )
         }
 
-        // Step 1: background-like classification.
-        var isBackground = [Bool](repeating: false, count: total)
+        // Subject prior: an impassable wall of pixels that are never background. When
+        // present it both decontaminates the border palette (dark border-touching
+        // clothing can't pollute it) and protects the subject from the flood.
+        let priorSubject = buildPriorSubject(subjectPrior, width: width, height: height)
 
-        if useAlpha {
-            for y in 0..<height {
-                let row = y * bpr
-                let maskRow = y * width
-                for x in 0..<width {
-                    isBackground[maskRow + x] = ptr[row + x * 4 + 3] < 40
-                }
-            }
-        } else {
+        // Background-like classification. A pixel is "background-like" if it can
+        // seed the flood. The opaque path keys on CIELAB ΔE to the border palette;
+        // the alpha path keys on the source's own transparency (the prior is ignored
+        // there — alpha is authoritative).
+        var isBackground = [Bool](repeating: false, count: total)
+        var dist8 = [UInt8](repeating: 0, count: total)   // per-pixel min ΔE to palette (opaque path)
+        var t0 = 0.0, t1 = 0.0, t2 = 0.0
+
+        func backgroundAt(_ x: Int, _ y: Int, threshold: Double) -> Bool {
+            if useAlpha { return ptr[y * bpr + x * 4 + 3] < 40 }
+            let idx = y * width + x
+            if let priorSubject, priorSubject[idx] { return false } // prior = subject, never bg
+            if ptr[y * bpr + x * 4 + 3] < 40 { return true }       // transparent = bg
+            return Double(dist8[idx]) <= threshold
+        }
+
+        if !useAlpha {
             // Quantise border colours (5 bits/channel) into a frequency table.
             var counts: [Int: Int] = [:]
             func quant(_ r: Int, _ g: Int, _ b: Int) -> Int {
@@ -107,6 +139,9 @@ extension ImagePipeline {
             func sampleBorder(_ x: Int, _ y: Int) {
                 let o = y * bpr + x * 4
                 guard ptr[o + 3] > 128 else { return } // ignore transparent border pixels
+                // Decontamination: a prior-subject border pixel is the character
+                // touching the edge, NOT background — skip it.
+                if let priorSubject, priorSubject[y * width + x] { return }
                 counts[quant(Int(ptr[o]), Int(ptr[o + 1]), Int(ptr[o + 2])), default: 0] += 1
             }
             for x in 0..<width { sampleBorder(x, 0); sampleBorder(x, height - 1) }
@@ -121,60 +156,112 @@ extension ImagePipeline {
                     return (((k >> 10) & 31) << 3 | 4, ((k >> 5) & 31) << 3 | 4, (k & 31) << 3 | 4)
                 }
 
-            // Fall back to a no-op detection if the border was fully transparent.
+            // Fall back to a no-op detection if the border was fully transparent
+            // (or the prior covered it entirely).
             guard !palette.isEmpty else {
                 throw PipelineError.renderFailed
             }
 
-            let threshold = Double(tolerance) * Double(tolerance)
+            // CIELAB keying. Precompute the sRGB→linear table once, convert the
+            // palette to LAB, then one full-res pass of per-pixel min ΔE76.
+            var lin = [Double](repeating: 0, count: 256)
+            for i in 0..<256 {
+                let c = Double(i) / 255
+                lin[i] = c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+            }
+            let paletteLab = palette.map { sRGBtoLab($0.r, $0.g, $0.b, lin: lin) }
             for y in 0..<height {
                 let row = y * bpr
                 let maskRow = y * width
                 for x in 0..<width {
                     let o = row + x * 4
-                    // Transparent pixels are always background.
-                    if ptr[o + 3] < 40 {
-                        isBackground[maskRow + x] = true
-                        continue
-                    }
-                    let r = Int(ptr[o])
-                    let g = Int(ptr[o + 1])
-                    let b = Int(ptr[o + 2])
+                    if ptr[o + 3] < 40 { continue } // transparent handled below
+                    let pLab = sRGBtoLab(Int(ptr[o]), Int(ptr[o + 1]), Int(ptr[o + 2]), lin: lin)
                     var best = Double.greatestFiniteMagnitude
-                    for c in palette {
-                        let dr = Double(r - c.r)
-                        let dg = Double(g - c.g)
-                        let db = Double(b - c.b)
-                        let dist = 2 * dr * dr + 4 * dg * dg + 3 * db * db
-                        if dist < best { best = dist; if best <= threshold { break } }
+                    for q in paletteLab {
+                        let de = deltaE76(pLab, q)
+                        if de < best {
+                            best = de
+                            if best == 0 { break }
+                        }
                     }
-                    isBackground[maskRow + x] = best <= threshold
+                    dist8[maskRow + x] = UInt8(min(best, 255))
                 }
+            }
+
+            // Adaptive tolerance: T0 = slider mapping; T1 expands the flood a step
+            // further so soft gradient/vignette pixels that drift past the sampled
+            // border colours still key; T2 (only with a prior) pushes deeper because
+            // the subject is prior-protected.
+            t0 = Double(deltaEThreshold(fromTolerance: tolerance))
+            t1 = t0 * 1.5
+            t2 = priorSubject != nil ? t0 * 2.25 : t0
+        }
+
+        for y in 0..<height {
+            let maskRow = y * width
+            for x in 0..<width {
+                isBackground[maskRow + x] = backgroundAt(x, y, threshold: t0)
             }
         }
 
-        // Step 2: flood the external background inward from every border pixel.
+        // Flood the external background inward from every border seed (prior pixels
+        // are never isBackground, so they can never seed).
         var isExternal = [Bool](repeating: false, count: total)
         var queue = [Int]()
         queue.reserveCapacity(total / 4)
-        func enqueueExternal(_ x: Int, _ y: Int) {
+        func enqueue(_ x: Int, _ y: Int) {
             let idx = y * width + x
             if isExternal[idx] || !isBackground[idx] { return }
             isExternal[idx] = true
             queue.append(idx)
         }
-        for x in 0..<width { enqueueExternal(x, 0); enqueueExternal(x, height - 1) }
-        for y in 0..<height { enqueueExternal(0, y); enqueueExternal(width - 1, y) }
+        for x in 0..<width { enqueue(x, 0); enqueue(x, height - 1) }
+        for y in 0..<height { enqueue(0, y); enqueue(width - 1, y) }
         var head = 0
         while head < queue.count {
             let idx = queue[head]; head += 1
             let cx = idx % width
             let cy = idx / width
-            if cx > 0 { enqueueExternal(cx - 1, cy) }
-            if cx < width - 1 { enqueueExternal(cx + 1, cy) }
-            if cy > 0 { enqueueExternal(cx, cy - 1) }
-            if cy < height - 1 { enqueueExternal(cx, cy + 1) }
+            if cx > 0 { enqueue(cx - 1, cy) }
+            if cx < width - 1 { enqueue(cx + 1, cy) }
+            if cy > 0 { enqueue(cx, cy - 1) }
+            if cy < height - 1 { enqueue(cx, cy + 1) }
         }
+
+        // Stepwise expansion: grow the external region through pixels whose ΔE sits
+        // between the current and next threshold. Each pass re-enqueues the frontier
+        // and stops when it adds nothing. No-op on the alpha path (its classification
+        // is threshold-independent, so nothing new qualifies).
+        func expand(to threshold: Double) {
+            var frontier = [Int]()
+            for i in 0..<total where isExternal[i] {
+                let cx = i % width, cy = i / width
+                let checks = [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]
+                for (nx, ny) in checks where nx >= 0 && nx < width && ny >= 0 && ny < height {
+                    let n = ny * width + nx
+                    if !isExternal[n] && backgroundAt(nx, ny, threshold: threshold) {
+                        isExternal[n] = true
+                        frontier.append(n)
+                    }
+                }
+            }
+            var fh = 0
+            while fh < frontier.count {
+                let idx = frontier[fh]; fh += 1
+                let cx = idx % width, cy = idx / width
+                let checks = [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]
+                for (nx, ny) in checks where nx >= 0 && nx < width && ny >= 0 && ny < height {
+                    let n = ny * width + nx
+                    if !isExternal[n] && backgroundAt(nx, ny, threshold: threshold) {
+                        isExternal[n] = true
+                        frontier.append(n)
+                    }
+                }
+            }
+        }
+        expand(to: t1)
+        if !useAlpha, priorSubject != nil { expand(to: t2) }
 
         // Step 3 + 4: subject = not external; optionally keep the largest blob.
         var keep = [Bool](repeating: false, count: total)
@@ -212,6 +299,18 @@ extension ImagePipeline {
             for idx in best { keep[idx] = true }
         } else {
             for i in 0..<total { keep[i] = !isExternal[i] }
+        }
+
+        // Near-full guard (opaque path only): a mask covering ≥99% of the frame is a
+        // failed key (whole canvas is "subject"), not a cutout — the caller degrades.
+        // ponytail: alpha path exempt — there the mask faithfully mirrors the source
+        // alpha and the upstream isUsableSubjectMask gate rejects near-full anyway.
+        if !useAlpha {
+            var keptCount = 0
+            for v in keep where v { keptCount += 1 }
+            if Double(keptCount) / Double(total) >= 0.99 {
+                throw PipelineError.renderFailed
+            }
         }
 
         var alphaBuf = [UInt8](repeating: 0, count: total)
@@ -433,7 +532,10 @@ extension ImagePipeline {
             areas.append(area)
         }
         guard let maxArea = areas.max() else { return } // no solid core: keep soft glow as-is
-        let minKeep = max(Int(Double(maxArea) * 0.02), 64)
+        // ponytail: a subject smaller than the 64px dust floor must not be wiped.
+        // The floor only makes sense when something bigger exists — when the whole
+        // mask is below it, keep the largest component instead of zeroing everything.
+        let minKeep = maxArea < 64 ? maxArea : max(Int(Double(maxArea) * 0.02), 64)
 
         // Flood from kept cores through any non-trivial alpha to retain glow halos.
         var visited = [Bool](repeating: false, count: total)
@@ -550,178 +652,864 @@ extension ImagePipeline {
         return result
     }
 
-    // MARK: - Mask refinement
+    // MARK: - Subject mask (tiered degradation ladder)
 
-    /// Grows (radius > 0, dilate) or shrinks (radius < 0, erode) a binary keep mask
-    /// using a separable square structuring element. Lets the user expand or trim
-    /// the whole selection by a few pixels at a time.
-    static func morphMask(_ mask: CGImage, radius: Int) -> CGImage? {
-        guard radius != 0 else { return mask }
-        let width = mask.width
-        let height = mask.height
-        guard width > 0, height > 0,
-              let md = mask.dataProvider?.data,
-              let mp = CFDataGetBytePtr(md) else { return nil }
-        let mbpr = mask.bytesPerRow
-
-        var src = [UInt8](repeating: 0, count: width * height)
-        for y in 0..<height {
-            let row = y * mbpr
-            let dst = y * width
-            for x in 0..<width { src[dst + x] = mp[row + x] }
+    /// Keep-mask with ALL subject components (no keep-largest trimming) for the
+    /// multi-candidate flow. A strict degradation ladder — "first usable tier wins":
+    ///
+    /// 1a. Vision `VNGenerateForegroundInstanceMaskRequest` (macOS 14+).
+    /// 1b. Attention-based saliency prior (all macOS 13+).
+    /// 2.  CIELAB ΔE border flood-fill, prior-informed (saliency-protected subject
+    ///     cannot be eaten by a dark background that matches its colours).
+    /// 3.  The raw saliency mask, when the flood produced nothing.
+    /// 4.  nil — graceful failure, never a full-frame mask, never a 4-corner contour.
+    ///
+    /// Every tier's output passes through `refineMask` (edge recovery → binary
+    /// closing → speck drop) and the uniform `isUsableSubjectMask` gate.
+    static func subjectMaskAll(cgImage: CGImage, tolerance: CGFloat) -> CGImage? {
+        // Step 1a — Vision subject segmentation is the strongest signal on macOS 14+.
+        if #available(macOS 14.0, *) {
+            if let mask = try? foregroundInstanceMask(cgImage: cgImage) {
+                let refined = refineMask(mask, source: cgImage)
+                if isUsableSubjectMask(refined) { return refined }
+            }
         }
+        // Step 1b — saliency prior. Not returned directly yet; it feeds the flood.
+        let prior = saliencySubjectMask(cgImage: cgImage)
+        // Step 2 — LAB ΔE flood with the prior as an impassable subject wall.
+        if let detection = try? detectForegroundShape(
+            cgImage: cgImage, tolerance: tolerance, keepLargest: false, subjectPrior: prior
+        ), detection.pixelCount > 0 {
+            let refined = refineMask(detection.mask, source: cgImage)
+            if isUsableSubjectMask(refined) { return refined }
+        }
+        // Step 3 — saliency alone (flood threw or emptied, e.g. the prior covered
+        // the entire border so no background palette survived).
+        if let prior {
+            let refined = refineMask(prior, source: cgImage)
+            if isUsableSubjectMask(refined) { return refined }
+        }
+        // Step 4 — nothing usable: nil, and the caller reports it. A full-frame
+        // mask or 4-corner outline is NEVER emitted from this ladder.
+        return nil
+    }
 
-        let r = abs(radius)
-        let dilate = radius > 0
-        var temp = [UInt8](repeating: 0, count: width * height)
-        var out = [UInt8](repeating: 0, count: width * height)
+    /// Vision `VNGenerateForegroundInstanceMaskRequest` output, converted into the
+    /// app's keep-mask convention (255 = subject). Vision's learned model segments
+    /// photographic content well but often returns the whole canvas as one instance
+    /// for flat game assets — a degenerate case we detect and drop in favour of the
+    /// flood-fill fallback. `nil` when the model found nothing usable.
+    ///
+    /// Layout notes (verified empirically): the returned CVPixelBuffer is
+    /// `kCVPixelFormatType_OneComponent8` but not byte-per-pixel addressable, so it
+    /// is rendered through CIContext into an RGBA8 CGImage whose R channel carries
+    /// the luminance: 0 = subject, 255 = background. Invert for keep-mask polarity.
+    /// The render is top-left origin, matching the source image and the app's mask
+    /// convention — no vertical flip.
+    @available(macOS 14.0, *)
+    static func foregroundInstanceMask(cgImage: CGImage) throws -> CGImage? {
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        try handler.perform([request])
+        guard let obs = request.results?.first, !obs.allInstances.isEmpty else { return nil }
 
-        // Horizontal pass.
+        let index = IndexSet(integersIn: 0..<obs.allInstances.count)
+        let buffer = try obs.generateScaledMaskForImage(forInstances: index, from: handler)
+        let w = CVPixelBufferGetWidth(buffer)
+        let h = CVPixelBufferGetHeight(buffer)
+        guard w > 0, h > 0 else { return nil }
+
+        let ci = CIImage(cvPixelBuffer: buffer)
+        // Reuse the pipeline's single CIContext — it is thread-safe, and a fresh
+        // one per call wastes a GPU/Metal stack.
+        guard let rendered = ImagePipeline.context.createCGImage(
+            ci, from: CGRect(x: 0, y: 0, width: w, height: h),
+            format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB()
+        ), let d = rendered.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return nil }
+
+        let bpr = rendered.bytesPerRow
+        // Threshold so the soft feathered boundary becomes a crisp binary keep-mask,
+        // then scan for a usable subject ratio (1%–99% keeps Vision's output).
+        var kept = 0
+        for y in 0..<h {
+            let row = y * bpr
+            for x in 0..<w where p[row + x * 4] < 128 { kept += 1 } // 0 luminance = subject
+        }
+        let total = w * h
+        let ratio = Double(kept) / Double(total)
+        guard ratio > 0.01, ratio < 0.99 else { return nil }
+
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let out = ctx.data else { return nil }
+        let outBpr = ctx.bytesPerRow
+        let dst = out.bindMemory(to: UInt8.self, capacity: h * outBpr)
+        for y in 0..<h {
+            let row = y * bpr
+            let dRow = y * outBpr
+            for x in 0..<w {
+                dst[dRow + x] = p[row + x * 4] < 128 ? 255 : 0
+            }
+        }
+        return ctx.makeImage()
+    }
+
+    // MARK: - Saliency subject prior (Vision attention map)
+
+    /// Converts a source image into a binary "subject prior" keep-mask using
+    /// `VNGenerateAttentionBasedSaliencyImageRequest` (macOS 10.13+ — always
+    /// available on the 13.0 minimum): the attention heat map is Otsu-thresholded,
+    /// the largest central component is kept, and the result is upscaled to source
+    /// resolution. Returns nil on flat assets / uniform attention (the kept-fraction
+    /// gates reject them) — a caller treats nil as "no prior".
+    static func saliencySubjectMask(cgImage: CGImage) -> CGImage? {
+        let small = ImagePipeline.downscale(cgImage, maxEdge: 512)
+        guard let luminance = saliencyMapLuminance(cgImage: small) else { return nil }
+        guard let smallMask = saliencySubjectMask(luminance: luminance) else { return nil }
+        // Nearest-neighbor upscale of the binary mask to full size — shape-lossless.
+        return upscaleBinaryMask(smallMask, toWidth: cgImage.width, height: cgImage.height)
+    }
+
+    /// Attention heat map of `cgImage` as a grayscale CGImage (bright = salient),
+    /// same size as the input. Renders the Vision `pixelBuffer` (inherited from
+    /// `VNPixelBufferObservation`) through the pipeline's shared CIContext. Returns
+    /// nil on any failure — Vision saliency is best-effort.
+    private static func saliencyMapLuminance(cgImage: CGImage) -> CGImage? {
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        let request = VNGenerateAttentionBasedSaliencyImageRequest()
+        do { try handler.perform([request]) } catch { return nil }
+        guard let obs = request.results?.first as? VNSaliencyImageObservation else { return nil }
+        let buffer = obs.pixelBuffer
+        let w = CVPixelBufferGetWidth(buffer)
+        let h = CVPixelBufferGetHeight(buffer)
+        guard w > 0, h > 0 else { return nil }
+        let ci = CIImage(cvPixelBuffer: buffer)
+        guard let rendered = ImagePipeline.context.createCGImage(
+            ci, from: CGRect(x: 0, y: 0, width: w, height: h),
+            format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB()
+        ) else { return nil }
+        return rendered
+    }
+
+    /// Pure, Vision-free binarization of a saliency luminance buffer into a subject
+    /// keep-mask (255 = subject; HIGH saliency = subject). Reads the R channel of an
+    /// RGBA image (or the byte of a grayscale one), applies an optional vertical
+    /// flip (orientation escape hatch), Otsu-thresholds, keeps the largest central
+    /// component, and gates the kept fraction to a sane range. Returns nil when the
+    /// map is empty or covers (almost) the whole frame.
+    static func saliencySubjectMask(luminance: CGImage, flipY: Bool = false) -> CGImage? {
+        let width = luminance.width
+        let height = luminance.height
+        guard width > 1, height > 1,
+              let d = luminance.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return nil }
+        let bpr = luminance.bytesPerRow
+        let hasAlpha = luminance.alphaInfo != .none
+        let total = width * height
+
+        var hist = [Int](repeating: 0, count: 256)
         for y in 0..<height {
-            let base = y * width
+            let row = y * bpr
             for x in 0..<width {
-                var acc: UInt8 = dilate ? 0 : 255
-                let x0 = max(0, x - r)
-                let x1 = min(width - 1, x + r)
-                var xi = x0
-                while xi <= x1 {
-                    let v = src[base + xi]
-                    if dilate { if v > acc { acc = v } } else if v < acc { acc = v }
-                    xi += 1
-                }
-                temp[base + x] = acc
+                let off = row + x * (hasAlpha ? 4 : 1)
+                let v = Int(p[off])
+                hist[min(max(v, 0), 255)] += 1
             }
         }
-        // Vertical pass.
-        for x in 0..<width {
-            for y in 0..<height {
-                var acc: UInt8 = dilate ? 0 : 255
-                let y0 = max(0, y - r)
-                let y1 = min(height - 1, y + r)
-                var yi = y0
-                while yi <= y1 {
-                    let v = temp[yi * width + x]
-                    if dilate { if v > acc { acc = v } } else if v < acc { acc = v }
-                    yi += 1
-                }
-                out[y * width + x] = acc
+        let t = otsuThreshold(histogram: hist, total: total)
+        var subject = [Bool](repeating: false, count: total)
+        for y in 0..<height {
+            let row = y * bpr
+            let sy = flipY ? (height - 1 - y) : y
+            for x in 0..<width {
+                let off = row + x * (hasAlpha ? 4 : 1)
+                let v = Int(p[off])
+                // Strictly-above: Otsu's class-2 is the salient minority. The
+                // threshold lands on a histogram mode, so v >= t would keep the
+                // whole frame when Otsu picks t = 0 for a bright-spot-on-dark map.
+                subject[sy * width + x] = v > t
             }
         }
+        var keptCount = 0
+        for v in subject where v { keptCount += 1 }
+        let fraction = Double(keptCount) / Double(total)
+        guard fraction > 0.01, fraction < 0.98 else { return nil }
 
+        // Largest central component: prefer a component whose centroid sits inside
+        // the central 50% box, else the globally largest one.
+        let minArea = max(16, total / 600)
+        let components = connectedComponents(fg: subject, width: width, height: height, minArea: minArea)
+        guard !components.isEmpty else { return nil }
+        let cxLo = width / 4, cxHi = (3 * width) / 4
+        let cyLo = height / 4, cyHi = (3 * height) / 4
+        let central = components.first { comp -> Bool in
+            var sx = 0, sy = 0
+            for i in comp { sx += i % width; sy += i / width }
+            let cx = sx / comp.count, cy = sy / comp.count
+            return cx >= cxLo && cx <= cxHi && cy >= cyLo && cy <= cyHi
+        } ?? components[0]
+        let compFraction = Double(central.count) / Double(total)
+        guard compFraction > 0.01, compFraction < 0.98 else { return nil }
+
+        var keep = [UInt8](repeating: 0, count: total)
+        for i in central { keep[i] = 255 }
         guard let ctx = CGContext(
             data: nil, width: width, height: height,
             bitsPerComponent: 8, bytesPerRow: width,
             space: CGColorSpaceCreateDeviceGray(),
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ), let data = ctx.data else { return nil }
-        let ptr = data.bindMemory(to: UInt8.self, capacity: width * height)
-        out.withUnsafeBufferPointer { buf in
-            if let base = buf.baseAddress { ptr.update(from: base, count: width * height) }
+        let dst = data.bindMemory(to: UInt8.self, capacity: total)
+        for i in 0..<total { dst[i] = keep[i] }
+        return ctx.makeImage()
+    }
+
+    /// Nearest-neighbor upscale of a small binary keep-mask to `toWidth × height`.
+    /// Binary masks are shape-lossless under NN upscale (no smoothing to invent).
+    private static func upscaleBinaryMask(_ mask: CGImage, toWidth: Int, height: Int) -> CGImage? {
+        let sw = mask.width, sh = mask.height
+        guard sw > 0, sh > 0, toWidth >= sw, height >= sh,
+              let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return mask }
+        let bpr = mask.bytesPerRow
+        guard let ctx = CGContext(
+            data: nil, width: toWidth, height: height,
+            bitsPerComponent: 8, bytesPerRow: toWidth,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let data = ctx.data else { return mask }
+        let dst = data.bindMemory(to: UInt8.self, capacity: toWidth * height)
+        for y in 0..<height {
+            let sy = min(sh - 1, (y * sh) / height)
+            for x in 0..<toWidth {
+                let sx = min(sw - 1, (x * sw) / toWidth)
+                dst[y * toWidth + x] = p[sy * bpr + sx]
+            }
         }
         return ctx.makeImage()
     }
 
-    /// Paints a brush stroke into a keep mask: `add` includes the painted area in
-    /// the subject (white), otherwise it excludes it (black). Reuses the editor's
-    /// brush rasterizer so size/shape/hardness match the rest of the app.
-    static func paintShapeMask(
-        mask: CGImage,
-        stroke: [CGPoint],
-        brushSize: CGFloat,
-        brushShape: BrushShape,
-        brushHardness: CGFloat,
-        add: Bool
-    ) throws -> CGImage {
-        let width = mask.width
-        let height = mask.height
-        guard width > 0, height > 0,
-              let md = mask.dataProvider?.data,
-              let mp = CFDataGetBytePtr(md) else { throw PipelineError.renderFailed }
-        let mbpr = mask.bytesPerRow
+    // MARK: - Shared image statistics (Otsu, CIELAB, usability)
 
-        let coverage = try rasterizeRemovalBuffer(
-            width: width, height: height,
-            strokes: [stroke], polygons: [],
-            brushSize: brushSize, brushShape: brushShape,
-            brushHardness: brushHardness, feather: 0,
-            selectionMask: nil
-        )
-        defer { coverage.deallocate() }
-
-        guard let ctx = CGContext(
-            data: nil, width: width, height: height,
-            bitsPerComponent: 8, bytesPerRow: width,
-            space: CGColorSpaceCreateDeviceGray(),
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        ), let data = ctx.data else { throw PipelineError.renderFailed }
-        let out = data.bindMemory(to: UInt8.self, capacity: width * height)
-
-        for y in 0..<height {
-            let mRow = y * mbpr
-            let oRow = y * width
-            for x in 0..<width {
-                let base = Int(mp[mRow + x])
-                let cov = Int(coverage[oRow + x])
-                if add {
-                    out[oRow + x] = UInt8(max(base, cov))
-                } else {
-                    out[oRow + x] = UInt8(min(base, 255 - cov))
-                }
-            }
+    /// Otsu threshold (argmax between-class variance) over a 0…255 histogram.
+    /// Class 1 = values ≤ t. Returns 128 for a degenerate (empty or single-valued)
+    /// histogram — callers' kept-fraction gates reject such output anyway.
+    static func otsuThreshold(histogram: [Int], total: Int) -> Int {
+        guard total > 0, histogram.count == 256 else { return 128 }
+        var sum = 0
+        for (i, c) in histogram.enumerated() { sum += i * c }
+        var sumB = 0
+        var wB = 0
+        var bestT = 128
+        var bestVar = -1.0
+        for t in 0...255 {
+            let wF = histogram[t]
+            if wF == 0 { continue }
+            wB += wF
+            sumB += t * wF
+            let wFCount = total - wB
+            if wB == 0 || wFCount == 0 { continue }
+            let muB = Double(sumB) / Double(wB)
+            let muF = Double(sum - sumB) / Double(wFCount)
+            let variance = Double(wB) * Double(wFCount) * (muB - muF) * (muB - muF)
+            if variance > bestVar { bestVar = variance; bestT = t }
         }
-        return ctx.makeImage() ?? mask
+        return bestVar >= 0 ? bestT : 128
     }
 
-    /// Tight bounding box (pixel coords, top-left origin) of a binary keep mask.
-    static func maskBoundingBox(_ mask: CGImage) -> CGRect {
-        let width = mask.width
-        let height = mask.height
-        guard let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return .zero }
+    /// Slider tolerance → CIELAB ΔE keying threshold. The old weighted-RGB threshold
+    /// (tolerance² in 2dr²+4dg²+3db²) was direction-dependent — roughly ΔE 8
+    /// achromatic to ΔE 35 chromatic at the default 60. 0.375 lands on the midpoint
+    /// (ΔE 22.5 at default) so the slider's default keeps equivalent behavior while
+    /// the range stays meaningful. Floor 4.0 keeps the slider from ever being a
+    /// no-op key.
+    static func deltaEThreshold(fromTolerance tolerance: CGFloat) -> CGFloat {
+        max(4.0, tolerance * 0.375)
+    }
+
+    /// sRGB (0…255) → CIELAB (D65), using the shared sRGB→linear table.
+    private static func sRGBtoLab(_ r: Int, _ g: Int, _ b: Int, lin: [Double]) -> (l: Double, a: Double, b: Double) {
+        let rl = lin[min(max(r, 0), 255)]
+        let gl = lin[min(max(g, 0), 255)]
+        let bl = lin[min(max(b, 0), 255)]
+        let x = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl
+        let y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl
+        let z = 0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl
+        let xn = 0.95047, yn = 1.0, zn = 1.08883
+        func f(_ t: Double) -> Double { t > 0.008856 ? cbrt(t) : 7.787 * t + 16.0 / 116.0 }
+        let fy = f(y / yn)
+        let l = 116 * fy - 16
+        let a = 500 * (f(x / xn) - fy)
+        let b = 200 * (fy - f(z / zn))
+        return (l, a, b)
+    }
+
+    /// CIEDE2000 is overkill; ΔE76 (Euclidean in LAB) is the perceptual key.
+    private static func deltaE76(_ p: (Double, Double, Double), _ q: (Double, Double, Double)) -> Double {
+        let dl = p.0 - q.0, da = p.1 - q.1, db = p.2 - q.2
+        return (dl * dl + da * da + db * db).squareRoot()
+    }
+
+    /// Expands a (possibly downscaled) subject prior to a full-resolution [Bool]
+    /// keep set. A 3×3 max-window upscale acts as a one-prior-pixel dilation so thin
+    /// border-touching parts (hair, a staff tip) are never missed. Returns nil when
+    /// the prior is absent or unreadable — the caller treats it as "no prior".
+    static func buildPriorSubject(_ prior: CGImage?, width: Int, height: Int) -> [Bool]? {
+        guard let prior, prior.width > 0, prior.height > 0,
+              let d = prior.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return nil }
+        let pw = prior.width, ph = prior.height, pbpr = prior.bytesPerRow
+        var out = [Bool](repeating: false, count: width * height)
+        // The 3x3 max-window below doubles as a one-prior-pixel dilation in the
+        // same-size case (the live flow), so thin border-touching parts the prior
+        // only partially covers stay protected instead of being flood-eaten.
+        for y in 0..<height {
+            let by = min(ph - 1, (y * ph) / height)
+            let y0 = max(0, by - 1), y1 = min(ph - 1, by + 1)
+            for x in 0..<width {
+                let bx = min(pw - 1, (x * pw) / width)
+                let x0 = max(0, bx - 1), x1 = min(pw - 1, bx + 1)
+                var hit = false
+                for yy in y0...y1 {
+                    let row = yy * pbpr
+                    for xx in x0...x1 where p[row + xx] > 127 { hit = true; break }
+                    if hit { break }
+                }
+                if hit { out[y * width + x] = true }
+            }
+        }
+        return out
+    }
+
+    /// Uniform gate for a tier's output: the kept fraction (bytes > 127) must be in
+    /// (minRatio, maxRatio) — rejects both empty masks and near-full-frame masks, so
+    /// no branch of the ladder can ever emit a full-frame outline.
+    static func isUsableSubjectMask(_ mask: CGImage, minRatio: Double = 0.01, maxRatio: Double = 0.99) -> Bool {
+        let w = mask.width, h = mask.height
+        guard w > 0, h > 0, let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return false }
         let bpr = mask.bytesPerRow
-        var minX = width, minY = height, maxX = -1, maxY = -1
+        var kept = 0
+        for y in 0..<h {
+            let row = y * bpr
+            for x in 0..<w where p[row + x] > 127 { kept += 1 }
+        }
+        let ratio = Double(kept) / Double(w * h)
+        return ratio > minRatio && ratio < maxRatio
+    }
+
+    // MARK: - Morphological & Sobel refinement (Tier 3)
+
+    /// Box dilation (radius r → (2r+1)² window, circular mask dx²+dy² ≤ r²). OOB = 0
+    /// (background), so the mask never grows past the frame. r=1 is 8-connectivity,
+    /// matching `connectedComponents`.
+    static func binaryDilate(_ inBuf: [UInt8], width: Int, height: Int, radius: Int) -> [UInt8] {
+        let total = width * height
+        var out = [UInt8](repeating: 0, count: total)
+        guard radius >= 0 else { return inBuf }
+        if radius == 0 { return inBuf }
+        let r2 = radius * radius
+        for y in 0..<height {
+            let y0 = max(0, y - radius), y1 = min(height - 1, y + radius)
+            for x in 0..<width {
+                let x0 = max(0, x - radius), x1 = min(width - 1, x + radius)
+                var hit = false
+                for yy in y0...y1 {
+                    let dy = yy - y
+                    let row = yy * width
+                    for xx in x0...x1 {
+                        let dx = xx - x
+                        if dx * dx + dy * dy <= r2 && inBuf[row + xx] > 127 { hit = true; break }
+                    }
+                    if hit { break }
+                }
+                if hit { out[y * width + x] = 255 }
+            }
+        }
+        return out
+    }
+
+    /// Box erosion — the inverse of `binaryDilate` with the same kernel.
+    static func binaryErode(_ inBuf: [UInt8], width: Int, height: Int, radius: Int) -> [UInt8] {
+        let total = width * height
+        var out = [UInt8](repeating: 0, count: total)
+        guard radius >= 0 else { return inBuf }
+        if radius == 0 { return inBuf }
+        let r2 = radius * radius
+        for y in 0..<height {
+            let y0 = max(0, y - radius), y1 = min(height - 1, y + radius)
+            for x in 0..<width {
+                let x0 = max(0, x - radius), x1 = min(width - 1, x + radius)
+                var hit = true
+                for yy in y0...y1 {
+                    let dy = yy - y
+                    let row = yy * width
+                    for xx in x0...x1 {
+                        let dx = xx - x
+                        if dx * dx + dy * dy <= r2 && inBuf[row + xx] <= 127 { hit = false; break }
+                    }
+                    if !hit { break }
+                }
+                if hit { out[y * width + x] = 255 }
+            }
+        }
+        return out
+    }
+
+    /// Morphological closing = dilation then erosion. Closes sub-2r interior seams
+    /// (arm–torso) without moving the outer silhouette.
+    static func binaryClose(_ inBuf: [UInt8], width: Int, height: Int, radius: Int) -> [UInt8] {
+        binaryErode(binaryDilate(inBuf, width: width, height: height, radius: radius),
+                    width: width, height: height, radius: radius)
+    }
+
+    /// Sobel gradient magnitude on the source's Rec.601 luminance, row-major [Float]
+    /// (0 at the frame border). Strong edges are where a character silhouette really
+    /// lives — used to re-attach thin strands the flood ate.
+    private static func sobelMagnitude(rgba: UnsafeMutablePointer<UInt8>, width: Int, height: Int, bpr: Int) -> [Float] {
+        let total = width * height
+        var lum = [UInt8](repeating: 0, count: total)
         for y in 0..<height {
             let row = y * bpr
-            for x in 0..<width where p[row + x] > 24 {
-                if x < minX { minX = x }
-                if x > maxX { maxX = x }
-                if y < minY { minY = y }
-                if y > maxY { maxY = y }
+            for x in 0..<width {
+                let o = row + x * 4
+                let r = Int(rgba[o]), g = Int(rgba[o + 1]), b = Int(rgba[o + 2])
+                lum[y * width + x] = UInt8((77 * r + 150 * g + 29 * b) >> 8)
             }
         }
-        return maxX >= minX
-            ? CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
-            : .zero
+        var mag = [Float](repeating: 0, count: total)
+        for y in 1..<(height - 1) {
+            let r = y * width
+            let r0 = r - width, r2 = r + width
+            for x in 1..<(width - 1) {
+                let tl = Int(lum[r0 + x - 1]), tm = Int(lum[r0 + x]), tr = Int(lum[r0 + x + 1])
+                let ml = Int(lum[r + x - 1]), mr = Int(lum[r + x + 1])
+                let bl = Int(lum[r2 + x - 1]), bm = Int(lum[r2 + x]), br = Int(lum[r2 + x + 1])
+                let gx = Float(tr + 2 * mr + br - tl - 2 * ml - bl)
+                let gy = Float(bl + 2 * bm + br - tl - 2 * tm - tr)
+                mag[r + x] = (gx * gx + gy * gy).squareRoot()
+            }
+        }
+        return mag
     }
 
-    /// Full-size red-overlay source built from a keep mask (white subject on a
-    /// transparent background). Used to refresh the canvas overlay after the mask
-    /// is grown/shrunk or brush-refined.
-    static func keepMaskOverlay(_ mask: CGImage) -> CGImage? {
-        let width = mask.width
-        let height = mask.height
-        guard let md = mask.dataProvider?.data, let mp = CFDataGetBytePtr(md) else { return nil }
-        let mbpr = mask.bytesPerRow
-        guard let ctx = CGContext(
+    /// Re-attaches the outermost ring of a mask onto strong edges: each iteration
+    /// sets a background pixel to subject iff it is a strong-edge pixel 4-adjacent to
+    /// a current subject pixel. Re-snapshots each iteration, so a 1-iteration pass
+    /// recovers the exact 1px outer ring without drifting the bounding box.
+    private static func edgeAnchoredRecover(mask: [UInt8], edge: [Bool], width: Int, height: Int, iters: Int) -> [UInt8] {
+        var out = mask
+        for _ in 0..<iters {
+            let snap = out
+            var changed = false
+            for y in 0..<height {
+                let r = y * width
+                for x in 0..<width {
+                    let idx = r + x
+                    if snap[idx] > 127 || !edge[idx] { continue }
+                    let adjacent = (x > 0 && snap[idx - 1] > 127)
+                        || (x < width - 1 && snap[idx + 1] > 127)
+                        || (y > 0 && snap[idx - width] > 127)
+                        || (y < height - 1 && snap[idx + width] > 127)
+                    if adjacent { out[idx] = 255; changed = true }
+                }
+            }
+            if !changed { break }
+        }
+        return out
+    }
+
+    /// Uniform post-processing for whatever mask wins the ladder: Sobel edge-anchored
+    /// recovery → morphological closing → speck drop → rebuild. Every step degrades
+    /// gracefully (a failure keeps the previous buffer), so this never fails on a
+    /// valid input. Returns the (possibly unchanged) mask.
+    private static func refineMask(_ mask: CGImage, source: CGImage) -> CGImage {
+        guard let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return mask }
+        let width = mask.width, height = mask.height
+        let bpr = mask.bytesPerRow
+        let total = width * height
+        var buf = [UInt8](repeating: 0, count: total)
+        for y in 0..<height {
+            let row = y * bpr
+            for x in 0..<width { buf[y * width + x] = p[row + x] }
+        }
+
+        // 1. Edge-anchored recovery: pull the outer ring back onto crisp silhouette
+        //    edges (hair strands, thin clothing lines) that keying dropped.
+        if let ctx = CGContext(
             data: nil, width: width, height: height,
             bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ), let data = ctx.data else { return nil }
-        let bpr = ctx.bytesPerRow
-        let ptr = data.bindMemory(to: UInt8.self, capacity: height * bpr)
-        memset(ptr, 0, height * bpr)
-        for y in 0..<height {
-            let mRow = y * mbpr
-            let row = y * bpr
-            for x in 0..<width {
-                let v = mp[mRow + x]
-                if v == 0 { continue }
-                // Premultiplied white graded by keep strength → soft red preview
-                // that fades across feathered/glow edges instead of a hard cutoff.
-                let off = row + x * 4
-                ptr[off] = v; ptr[off + 1] = v; ptr[off + 2] = v; ptr[off + 3] = v
+        ) {
+            // Draw the source into a full-res RGBA context (it may be a different
+            // size to the mask) then read luminance for the Sobel pass.
+            ctx.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+            if let rgba = ctx.data {
+                let srcBpr = ctx.bytesPerRow
+                let srcPtr = rgba.bindMemory(to: UInt8.self, capacity: height * srcBpr)
+                let mag = sobelMagnitude(rgba: srcPtr, width: width, height: height, bpr: srcBpr)
+                // Adaptive edge threshold: Otsu on a coarse magnitude histogram, with
+                // a floor so flat backgrounds never count as edges.
+                var hist = [Int](repeating: 0, count: 256)
+                var mTotal = 0
+                for m in mag where m > 0 {
+                    hist[min(Int(m / 6.0), 255)] += 1
+                    mTotal += 1
+                }
+                let tau = max(otsuThreshold(histogram: hist, total: mTotal) * 6, 32)
+                var edge = [Bool](repeating: false, count: total)
+                for i in 0..<total where mag[i] >= Float(tau) { edge[i] = true }
+                buf = edgeAnchoredRecover(mask: buf, edge: edge, width: width, height: height, iters: 1)
             }
         }
-        return ctx.makeImage()
+
+        // 2. Morphological closing — closes the dominant 1–2px anti-aliased seam
+        //    (arm–torso) while the capped radius (≤2) can never merge characters a
+        //    real gap apart.
+        let closeRadius = max(1, min(2, Int(sqrt(CGFloat(max(width, height))) / 24.0)))
+        buf = binaryClose(buf, width: width, height: height, radius: closeRadius)
+
+        // 3. Drop isolated specks (reuses the existing checkerboard helper).
+        dropDisconnectedSpecks(&buf, width: width, height: height)
+
+        guard let rebuilt = try? buildMaskResult(buf, width: width, height: height) else { return mask }
+        return rebuilt.mask
+    }
+
+    // MARK: - Contour extraction & simplification
+
+    /// Ordered boundary of the largest connected subject region in a keep mask, as
+    /// pixel-space points (top-left origin). Each point is a foreground pixel
+    /// touching background (Moore-neighbour trace). The mask is thresholded at 128.
+    static func contourPoints(from mask: CGImage) -> [CGPoint] {
+        let width = mask.width
+        let height = mask.height
+        guard width > 1, height > 1,
+              let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return [] }
+        let bpr = mask.bytesPerRow
+        let total = width * height
+        var fg = [Bool](repeating: false, count: total)
+        for y in 0..<height {
+            let row = y * bpr
+            for x in 0..<width where p[row + x] > 127 { fg[y * width + x] = true }
+        }
+        return contourPoints(fromFG: fg, width: width, height: height)
+    }
+
+    /// Same as `contourPoints(from:)` but over a precomputed boolean mask.
+    private static func contourPoints(fromFG fg: [Bool], width: Int, height: Int) -> [CGPoint] {
+        let total = width * height
+        var subjectCount = 0
+        for v in fg where v { subjectCount += 1 }
+        // Degenerate: subject is (practically) the whole canvas — a failed key, not a
+        // cutout. A 4-corner full-frame rectangle is NEVER a valid contour, so return
+        // empty and let the caller degrade (report, try a lower tier, show nothing).
+        if subjectCount >= Int(Double(total) * 0.99) {
+            return []
+        }
+        guard let largest = largestComponent(fg: fg, width: width, height: height),
+              largest.count > 0 else { return [] }
+
+        func isFg(_ x: Int, _ y: Int) -> Bool {
+            x >= 0 && x < width && y >= 0 && y < height && largest[y * width + x]
+        }
+
+        // Corner-space boundary edges: pixel (x,y) occupies corners (x,y)…(x+1,y+1).
+        // A side is on the boundary when the pixel across it is background. Sides
+        // are directed clockwise in y-down space (top E, right S, bottom W, left N),
+        // so following `next` walks a closed loop. Each corner keeps one outgoing
+        // edge (last write wins).
+        // ponytail: two foreground pixels meeting only at a point (checkerboard
+        // corner) fold into a single outgoing arc — the loop stays closed, the
+        // notch just loses a pixel of detail. Hand-verified on L-shape notches and
+        // vertical bars; outer-loop selection by largest |shoelace area| is robust
+        // to the resulting tiny artifacts.
+        let cw = width + 1, ch = height + 1
+        var next = [Int](repeating: -1, count: cw * ch)
+        func ci(_ x: Int, _ y: Int) -> Int { y * cw + x }
+        for y in 0..<height {
+            for x in 0..<width where largest[y * width + x] {
+                if !isFg(x, y - 1) { next[ci(x, y)] = ci(x + 1, y) }            // top E
+                if !isFg(x, y + 1) { next[ci(x + 1, y + 1)] = ci(x, y + 1) }    // bottom W
+                if !isFg(x - 1, y) { next[ci(x, y + 1)] = ci(x, y) }            // left N
+                if !isFg(x + 1, y) { next[ci(x + 1, y)] = ci(x + 1, y + 1) }    // right S
+            }
+        }
+
+        // Walk every cycle (consuming edges as we go) and keep the one with the
+        // largest |shoelace area| — the outer boundary; hole loops wind the other
+        // way and are smaller.
+        var best: [(Int, Int)] = []
+        var bestArea: CGFloat = 0
+        for start in next.indices where next[start] != -1 {
+            var loop: [(Int, Int)] = []
+            var c = start
+            while true {
+                loop.append((c % cw, c / cw))
+                let n = next[c]
+                next[c] = -1 // consume so each edge is walked once
+                if n == start || n == -1 { break }
+                c = n
+            }
+            var area: CGFloat = 0
+            for i in 0..<loop.count {
+                let a = loop[i], b = loop[(i + 1) % loop.count]
+                area += CGFloat(a.0) * CGFloat(b.1) - CGFloat(b.0) * CGFloat(a.1)
+            }
+            if abs(area) > bestArea { bestArea = abs(area); best = loop }
+        }
+        // Fix A: reject by EXTENT, not just pixel count. A hollow border ring/frame
+        // has tiny AREA but full-frame extent — its largest loop is the canvas
+        // rectangle, which RDP collapses straight back into the forbidden 4-corner
+        // full-frame outline. Detect it by: the loop spans the whole canvas AND the
+        // subject hugs the canvas perimeter (a real silhouette that fills the frame
+        // keeps most of its pixels off the edge). The shoelace area itself is not a
+        // reliable coverage measure — the boundary walk can wind, inflating it.
+        if best.isEmpty { return [] }
+        var bMinX = width, bMinY = height, bMaxX = 0, bMaxY = 0
+        for (px, py) in best {
+            bMinX = min(bMinX, px); bMinY = min(bMinY, py)
+            bMaxX = max(bMaxX, px); bMaxY = max(bMaxY, py)
+        }
+        if bMinX == 0 && bMinY == 0 && bMaxX == width && bMaxY == height {
+            var edgePixels = 0
+            for y in 0..<height {
+                let row = y * width
+                for x in 0..<width where largest[row + x] {
+                    if x == 0 || x == width - 1 || y == 0 || y == height - 1 { edgePixels += 1 }
+                }
+            }
+            if Double(edgePixels) * 2 >= Double(subjectCount) {
+                return []
+            }
+        }
+        guard best.count >= 3 else { return [] }
+        return best.map { CGPoint(x: CGFloat($0.0), y: CGFloat($0.1)) }
+    }
+
+    /// Marks the single largest 8-connected foreground component.
+    private static func largestComponent(fg: [Bool], width: Int, height: Int) -> [Bool]? {
+        guard let biggest = connectedComponents(fg: fg, width: width, height: height, minArea: 1).first else {
+            return nil
+        }
+        var marks = [Bool](repeating: false, count: fg.count)
+        for i in biggest { marks[i] = true }
+        return marks
+    }
+
+    /// All 8-connected foreground components as `[Int]` row-major pixel indices,
+    /// largest first, dropping any component smaller than `minArea`.
+    private static func connectedComponents(fg: [Bool], width: Int, height: Int, minArea: Int) -> [[Int]] {
+        let total = fg.count
+        var visited = [Bool](repeating: false, count: total)
+        var components: [[Int]] = []
+        var stack: [Int] = []
+        for seed in fg.indices where fg[seed] && !visited[seed] {
+            visited[seed] = true
+            stack.removeAll(keepingCapacity: true)
+            stack.append(seed)
+            var head = 0
+            while head < stack.count {
+                let idx = stack[head]
+                head += 1
+                let cx = idx % width, cy = idx / width
+                for dy in -1...1 {
+                    let ny = cy + dy
+                    guard ny >= 0 && ny < height else { continue }
+                    for dx in -1...1 where !(dx == 0 && dy == 0) {
+                        let nx = cx + dx
+                        guard nx >= 0 && nx < width else { continue }
+                        let n = ny * width + nx
+                        if fg[n] && !visited[n] {
+                            visited[n] = true
+                            stack.append(n)
+                        }
+                    }
+                }
+            }
+            if stack.count >= minArea { components.append(stack) }
+        }
+        return components.sorted { $0.count > $1.count }
+    }
+
+    /// Ramer–Douglas–Peucker on an open polyline (keeps both endpoints).
+    static func rdpSimplify(_ points: [CGPoint], epsilon: CGFloat) -> [CGPoint] {
+        guard points.count > 2 else { return points }
+        let a = points[0], b = points[points.count - 1]
+        var maxDist: CGFloat = 0
+        var idx = 0
+        for i in 1..<(points.count - 1) {
+            let d = pointLineDistance(points[i], a, b)
+            if d > maxDist { maxDist = d; idx = i }
+        }
+        guard maxDist > epsilon else { return [a, b] }
+        let left = rdpSimplify(Array(points[0...idx]), epsilon: epsilon)
+        let right = rdpSimplify(Array(points[idx...]), epsilon: epsilon)
+        return left.dropLast() + right
+    }
+
+    /// RDP for a closed ring: split at the pair of most-distant points, simplify
+    /// each half as an open polyline, then join back into one closed loop.
+    static func rdpSimplifyClosed(_ points: [CGPoint], epsilon: CGFloat) -> [CGPoint] {
+        let n = points.count
+        guard n > 3 else { return points }
+        var farIdx = 0
+        var farDist: CGFloat = -1
+        for i in 1..<n {
+            let d = (points[i].x - points[0].x) * (points[i].x - points[0].x)
+                + (points[i].y - points[0].y) * (points[i].y - points[0].y)
+            if d > farDist { farDist = d; farIdx = i }
+        }
+        guard farDist > 0.25 else { return points } // degenerate: all points coincide
+        let a = rdpSimplify(Array(points[0...farIdx]), epsilon: epsilon)
+        let b = rdpSimplify(Array(points[farIdx...n - 1]) + [points[0]], epsilon: epsilon)
+        var ring = a.dropLast() + b
+        ring.removeLast() // b's trailing copy of points[0] duplicates a[0]
+        return Array(ring)
+    }
+
+    private static func pointLineDistance(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let lenSq = dx * dx + dy * dy
+        guard lenSq > 0 else { return sqrt((p.x - a.x) * (p.x - a.x) + (p.y - a.y) * (p.y - a.y)) }
+        let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq
+        let cx = a.x + t * dx, cy = a.y + t * dy
+        return sqrt((p.x - cx) * (p.x - cx) + (p.y - cy) * (p.y - cy))
+    }
+
+    /// Simplifies a mask's boundary to `maxPoints` (or fewer): runs RDP with an
+    /// ever-growing tolerance until the budget is met, so simple shapes collapse to
+    /// their corners while complex silhouettes keep more detail. Returns normalized
+    /// points (0…1, top-left origin) ready for pen-vertex anchors.
+    static func simplifiedPenContour(from mask: CGImage, maxPoints: Int) -> [CGPoint] {
+        let width = mask.width
+        let height = mask.height
+        let pts = contourPoints(from: mask)
+        guard !pts.isEmpty else { return [] }
+        return simplifyRing(pts, maxPoints: maxPoints, width: width, height: height)
+    }
+
+    /// RDP-simplifies a closed pixel-space ring down to `maxPoints` (or fewer) and
+    /// normalizes to 0…1. Shared budget loop behind `simplifiedPenContour` and the
+    /// multi-candidate extractor.
+    private static func simplifyRing(_ ring: [CGPoint], maxPoints: Int, width: Int, height: Int) -> [CGPoint] {
+        var pts = ring
+        if pts.count > maxPoints {
+            // Dynamic RDP tolerance: scale with canvas size so a 1000px silhouette
+            // keeps real contour detail (ε 3px) while a 200px one still smooths
+            // (ε 0.6px → floored to 1). Never over-simplify into a box.
+            var epsilon: CGFloat = max(CGFloat(max(width, height)) * 0.003, 1.0)
+            var guardCount = 0
+            while pts.count > maxPoints && guardCount < 30 {
+                pts = rdpSimplifyClosed(pts, epsilon: epsilon)
+                epsilon *= 1.5
+                guardCount += 1
+            }
+        }
+        // RDP over two open halves can collapse a thin ring (a 1px blade, a hair
+        // strand) to a 2-point chord — not a closed outline, and penPathSet would
+        // silently drop the part. A solid ring's raw boundary always has >= 4 points,
+        // so fall back to an even sample of it (still within the point budget).
+        if pts.count < 3, ring.count >= 4 {
+            let k = max(3, min(maxPoints, ring.count))
+            let step = CGFloat(ring.count) / CGFloat(k)
+            pts = (0..<k).map { ring[Int(CGFloat($0) * step)] }
+        }
+        let w = CGFloat(width), h = CGFloat(height)
+        return pts.map { CGPoint(x: $0.x / w, y: $0.y / h) }
+    }
+
+    /// Convex hull (monotone chain) of a point set, counter-clockwise. Returns nil
+    /// for fewer than 3 distinct points.
+    private static func convexHull(_ points: [CGPoint]) -> [CGPoint]? {
+        let pts = points.sorted { $0.x < $1.x || ($0.x == $1.x && $0.y < $1.y) }
+        guard pts.count >= 3 else { return nil }
+        func cross(_ o: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+            (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        }
+        var lower: [CGPoint] = []
+        for p in pts {
+            while lower.count >= 2 && cross(lower[lower.count - 2], lower[lower.count - 1], p) <= 0 {
+                lower.removeLast()
+            }
+            lower.append(p)
+        }
+        var upper: [CGPoint] = []
+        for p in pts.reversed() {
+            while upper.count >= 2 && cross(upper[upper.count - 2], upper[upper.count - 1], p) <= 0 {
+                upper.removeLast()
+            }
+            upper.append(p)
+        }
+        lower.removeLast()
+        upper.removeLast()
+        let hull = lower + upper
+        return hull.count >= 3 ? hull : nil
+    }
+
+    // MARK: - Multi-candidate path detection
+
+    /// Detects every connected subject component and returns it as a candidate pen
+    /// path, plus a combined full-logo outline. Candidate order:
+    /// 1. Combined outer path — the single component's own outline when there is
+    ///    only one (keeps its concavity), otherwise the convex hull of every
+    ///    component's boundary.
+    /// 2…n. Individual components, largest area first.
+    ///
+    /// Runs the subject detector (Vision on macOS 14+, else the border flood-fill)
+    /// then extracts the parts. Returns nil when nothing usable is detected.
+    static func detectPenPathSet(cgImage: CGImage, tolerance: CGFloat) -> DetectedPathSet? {
+        guard let mask = subjectMaskAll(cgImage: cgImage, tolerance: tolerance) else { return nil }
+        return penPathSet(fromMask: mask)
+    }
+
+    /// Multi-contour extraction over an already-computed keep mask. Split out from
+    /// `detectPenPathSet` so tests can feed a deterministic flood-fill mask instead
+    /// of Vision's learned (and sometimes surprising) subject segmentation.
+    static func penPathSet(fromMask mask: CGImage) -> DetectedPathSet? {
+        let width = mask.width
+        let height = mask.height
+        guard width > 1, height > 1,
+              let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return nil }
+        let bpr = mask.bytesPerRow
+        let total = width * height
+        var fg = [Bool](repeating: false, count: total)
+        for y in 0..<height {
+            let row = y * bpr
+            for x in 0..<width where p[row + x] > 127 { fg[y * width + x] = true }
+        }
+
+        // Drop specks too small to be a real part (also keeps the candidate list sane).
+        let minArea = max(16, total / 600)
+        let components = connectedComponents(fg: fg, width: width, height: height, minArea: minArea)
+        guard !components.isEmpty else { return nil }
+
+        var componentPaths: [[PolygonVertex]] = []
+        var boundaryPoints: [CGPoint] = []
+        for component in components {
+            var sub = [Bool](repeating: false, count: total)
+            for idx in component { sub[idx] = true }
+            let ring = contourPoints(fromFG: sub, width: width, height: height)
+            guard ring.count >= 3 else { continue }
+            let normalized = simplifyRing(ring, maxPoints: 80, width: width, height: height)
+            guard normalized.count >= 3 else { continue }
+            // Only a usable component contributes to the combined hull, so the
+            // "Full Logo" outline never encloses a region with no selectable part.
+            boundaryPoints.append(contentsOf: ring)
+            componentPaths.append(normalized.map { PolygonVertex(anchor: $0, controlIn: nil, controlOut: nil) })
+        }
+        guard !componentPaths.isEmpty else { return nil }
+
+        let combined: [PolygonVertex]
+        if componentPaths.count == 1 {
+            combined = componentPaths[0]
+        } else if let hull = convexHull(boundaryPoints), hull.count >= 3 {
+            let normalized = simplifyRing(hull, maxPoints: 80, width: width, height: height)
+            combined = normalized.map { PolygonVertex(anchor: $0, controlIn: nil, controlOut: nil) }
+        } else {
+            combined = componentPaths[0]
+        }
+
+        return DetectedPathSet(combinedOuterPath: combined, componentPaths: componentPaths)
     }
 }

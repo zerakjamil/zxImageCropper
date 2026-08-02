@@ -3,6 +3,7 @@ import SwiftUI
 struct RootView: View {
     @ObservedObject var viewModel: EditorViewModel
     @State private var showHelp = false
+    @AppStorage("isSidebarCollapsed") private var isSidebarCollapsed = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -61,13 +62,10 @@ struct RootView: View {
                         onRemovedSpotClick: { viewModel.restoreRemovedSpot(at: $0) },
                         originalImage: viewModel.originalImage,
                         livePreviewImage: viewModel.lumaLivePreview,
-                        shapeOverlayImage: viewModel.shapeOverlayImage,
-                        isShapeRefineMode: viewModel.isShapeRefineMode,
-                        shapeRefineAdd: viewModel.shapeRefineAdd,
                         pixelSize: viewModel.imagePixelSize,
                         onSelectTool: { viewModel.selectTool($0) }
                     )
-                    .frame(minWidth: 560, minHeight: 360)
+                    .frame(minWidth: 400, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
                     .overlay(zoomOverlay, alignment: .bottomTrailing)
                     .overlay(alignment: .topTrailing) {
                         Button("") { viewModel.zoomIn() }
@@ -85,16 +83,18 @@ struct RootView: View {
                         Button("") { viewModel.redo() }
                             .keyboardShortcut("z", modifiers: [.command, .shift])
                             .hidden()
-                        Button("") { viewModel.detectShape() }
+                        Button("") { viewModel.detectPenPathCandidates() }
                             .keyboardShortcut("d", modifiers: .command)
-                            .hidden()
-                        Button("") { viewModel.extractShape() }
-                            .keyboardShortcut("e", modifiers: .command)
                             .hidden()
                     }
 
-                    sidebar
-                        .frame(width: 275)
+                    if isSidebarCollapsed {
+                        collapsedSidebar
+                            .frame(width: 52)
+                    } else {
+                        sidebar
+                            .frame(width: 275)
+                    }
                 }
             } else {
                 placeholder
@@ -139,6 +139,16 @@ struct RootView: View {
             }
 
             Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isSidebarCollapsed.toggle()
+                }
+            } label: {
+                Image(systemName: isSidebarCollapsed ? "sidebar.left" : "sidebar.right")
+            }
+            .buttonStyle(.borderless)
+            .help(isSidebarCollapsed ? "Expand Sidebar" : "Minimize Sidebar to Icons")
+
+            Button {
                 showHelp.toggle()
             } label: {
                 Image(systemName: "questionmark.circle")
@@ -157,7 +167,7 @@ struct RootView: View {
                 .font(.headline)
             Group {
                 shortcutRow("1 – 5", "Crop · Brush · Pen · Wand · Slice")
-                shortcutRow("⌘D / ⌘E", "Smart Cutout: detect / extract")
+                shortcutRow("⌘D", "Auto Pen Path: detect parts")
                 shortcutRow("Hold \\", "Compare with original")
                 shortcutRow("Scroll / Pinch", "Zoom in & out (at cursor)")
                 shortcutRow("Hold Z + drag", "Pan the image")
@@ -188,6 +198,24 @@ struct RootView: View {
     private var sidebar: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Controls")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isSidebarCollapsed = true
+                        }
+                    } label: {
+                        Image(systemName: "sidebar.right")
+                            .font(.body)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Minimize Sidebar (Precision Mode)")
+                }
+                .padding(.horizontal, 4)
+
                 GroupBox("Crop") {
                     VStack(alignment: .leading, spacing: 8) {
                         Picker(
@@ -276,13 +304,13 @@ struct RootView: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 6) {
-                            Image(systemName: "wand.and.rays")
+                            Image(systemName: "lasso")
                                 .foregroundStyle(.red)
-                            Text("Smart Cutout")
+                            Text("Auto Pen Path Cutout")
                                 .font(.subheadline.weight(.semibold))
                         }
 
-                        Text("Auto-detect the main shape, preview it in red, then cut everything around it away onto a transparent background.")
+                        Text("Detect every part of the subject as an editable pen path, then cycle through the parts (or the full combined outline) and cut.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
 
@@ -290,152 +318,62 @@ struct RootView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Slider(value: $viewModel.shapeTolerance, in: 10...200, step: 1)
-                            .onChange(of: viewModel.shapeTolerance) { _ in viewModel.scheduleShapeDetection() }
                             .help("How aggressively background colours are removed. Higher = trims more of a soft glow/halo; lower = keeps more of it.")
 
-                        Text("Edge feather: \(String(format: "%.0f", viewModel.shapeEdgeFeather))px")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Slider(value: $viewModel.shapeEdgeFeather, in: 0...20, step: 1)
-
-                        Toggle(
-                            "Keep largest shape only",
-                            isOn: Binding(
-                                get: { viewModel.shapeKeepLargest },
-                                set: { viewModel.setShapeKeepLargest($0) }
-                            )
-                        )
-                        .toggleStyle(.switch)
-                        .font(.caption2)
-                        .help("Drop stray detached specks and keep only the single biggest shape.")
-
-                        Toggle("Auto-detect on open", isOn: $viewModel.autoDetectShapeOnOpen)
-                            .toggleStyle(.switch)
-                            .font(.caption2)
-                            .help("Run Detect Shape automatically whenever a new image is loaded.")
-
-                        HStack(spacing: 8) {
-                            Button {
-                                viewModel.detectShape()
-                            } label: {
-                                Label(viewModel.hasShapeDetection ? "Re-detect" : "Detect Shape", systemImage: "scope")
-                            }
-                            .buttonStyle(.bordered)
-                            .font(.caption)
-                            .help("Detect the shape  (⌘D)")
-                            .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey || viewModel.isDetectingShape || viewModel.inFlightEdits > 0)
-
-                            if viewModel.hasShapeDetection {
-                                Button {
-                                    viewModel.clearShapeDetection()
-                                } label: {
-                                    Label("Clear", systemImage: "xmark")
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                            }
-
-                            Spacer()
-
-                            if viewModel.isDetectingShape {
-                                ProgressView().controlSize(.small)
-                            }
-                        }
-
-                        if viewModel.hasShapeDetection {
-                            Divider()
-
-                            Text("Selected too much or too little? Adjust the red area:")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-
-                            HStack(spacing: 8) {
-                                Button {
-                                    viewModel.expandShape()
-                                } label: {
-                                    Label("Expand", systemImage: "arrow.up.left.and.arrow.down.right")
-                                        .frame(maxWidth: .infinity)
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                .help("Grow the whole selection outward a few pixels.")
-
-                                Button {
-                                    viewModel.shrinkShape()
-                                } label: {
-                                    Label("Shrink", systemImage: "arrow.down.right.and.arrow.up.left")
-                                        .frame(maxWidth: .infinity)
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                .help("Trim the whole selection inward a few pixels.")
-                            }
-
-                            Toggle(
-                                "Refine brush — paint to fix the edges",
-                                isOn: Binding(
-                                    get: { viewModel.isShapeRefineMode },
-                                    set: { viewModel.setShapeRefineMode($0) }
-                                )
-                            )
-                            .toggleStyle(.switch)
-                            .font(.caption2)
-
-                            if viewModel.isShapeRefineMode {
-                                Picker("", selection: $viewModel.shapeRefineAdd) {
-                                    Text("\(Image(systemName: "minus.circle")) Remove").tag(false)
-                                    Text("\(Image(systemName: "plus.circle")) Add").tag(true)
-                                }
-                                .pickerStyle(.segmented)
-                                .labelsHidden()
-
-                                Text("Brush size: \(String(format: "%.0f", viewModel.eraseBrushSize))px")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                Slider(value: $viewModel.eraseBrushSize, in: 2...1000, step: 1)
-
-                                Text(viewModel.shapeRefineAdd
-                                     ? "Paint over parts that were missed to include them."
-                                     : "Paint over the unneeded parts to cut them out.")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            HStack(spacing: 8) {
-                                Button {
-                                    viewModel.undoShapeMask()
-                                } label: {
-                                    Image(systemName: "arrow.uturn.backward")
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                .disabled(!viewModel.canUndoShapeMask)
-                                .help("Undo selection change  (⌘Z)")
-
-                                Button {
-                                    viewModel.redoShapeMask()
-                                } label: {
-                                    Image(systemName: "arrow.uturn.forward")
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                .disabled(!viewModel.canRedoShapeMask)
-                                .help("Redo selection change  (⇧⌘Z)")
-
-                                Spacer()
-                            }
-                        }
-
                         Button {
-                            viewModel.extractShape()
+                            viewModel.detectPenPathCandidates()
                         } label: {
-                            Label("Extract & Crop", systemImage: "scissors")
+                            Label(viewModel.isDetectingShape ? "Detecting…" : "Detect Pen Path", systemImage: "lasso")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
                         .font(.caption)
-                        .help("Cut everything around the selection  (⌘E)")
-                        .disabled(!viewModel.hasShapeDetection || viewModel.isSaving || viewModel.isRunningLumaKey || viewModel.isRunningShellAction || viewModel.inFlightEdits > 0)
+                        .help("Trace every detected part as an editable pen path  (⌘D)")
+                        .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningShellAction || viewModel.isRunningLumaKey || viewModel.isDetectingShape || viewModel.inFlightEdits > 0)
+
+                        if viewModel.isDetectingShape {
+                            ProgressView().controlSize(.small)
+                        }
+
+                        if viewModel.pathCandidates.count > 1 {
+                            HStack(spacing: 6) {
+                                Button {
+                                    viewModel.cyclePrevCandidate()
+                                } label: {
+                                    Label("◄ Prev", systemImage: "chevron.backward")
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .help("Previous detected part")
+
+                                Text("Shape \(viewModel.currentCandidateIndex + 1) of \(viewModel.pathCandidates.count)")
+                                    .font(.caption2)
+                                    .frame(maxWidth: .infinity)
+
+                                Button {
+                                    viewModel.cycleNextCandidate()
+                                } label: {
+                                    Label("Next ►", systemImage: "chevron.forward")
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .help("Next detected part")
+                            }
+
+                            Button {
+                                viewModel.selectCombinedOuterPath()
+                            } label: {
+                                Label("Full Logo (Combined Boundary)", systemImage: "rectangle.inset.filled")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
+                            .help("Jump back to the outline that encloses every part.")
+                        }
+
+                        Text("Then use the Pen tool (⌘3): drag dots to refine, click a segment's dot to add one, or cut with Erase Inside / Keep Inside.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -1050,7 +988,7 @@ struct RootView: View {
 
                     Divider()
 
-                    Text("Restore parts the key removed: detect enclosed holes, or use the Restore brush (tool 5 → Restore) for edge-connected areas.")
+                    Text("Restore parts the key removed: detect enclosed holes, dark outlines, edge shadows, and crevices.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
 
@@ -1067,6 +1005,17 @@ struct RootView: View {
                         .frame(width: 60)
                         Spacer()
                     }
+
+                    Toggle(
+                        "Include edge shadows & outlines",
+                        isOn: Binding(
+                            get: { viewModel.removedSpotIncludeEdges },
+                            set: { viewModel.setRemovedSpotIncludeEdges($0) }
+                        )
+                    )
+                    .toggleStyle(.switch)
+                    .font(.caption2)
+                    .help("Also detect deleted black outlines, shadows under layers, and edge crevices so you can restore their blackness without restoring the whole background.")
 
                     Button {
                         viewModel.detectRemovedSpots()
@@ -1093,6 +1042,12 @@ struct RootView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.green)
                             Spacer()
+                            Button("Restore All") {
+                                viewModel.restoreAllRemovedSpots()
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.isSaving || viewModel.inFlightEdits > 0)
                             Button("Clear") {
                                 viewModel.clearRemovedSpots()
                             }
@@ -1251,5 +1206,150 @@ struct RootView: View {
         .padding(.vertical, 4)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
         .padding(8)
+    }
+
+    private var collapsedSidebar: some View {
+        VStack(spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isSidebarCollapsed = false
+                }
+            } label: {
+                Image(systemName: "sidebar.left")
+                    .font(.system(size: 15, weight: .semibold))
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.borderless)
+            .help("Expand Sidebar")
+
+            Divider()
+
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 8) {
+                    Group {
+                        collapsedToolButton(title: "Crop / Select Mode", icon: "crop", tag: 0)
+                        collapsedToolButton(title: "Brush Erase", icon: "paintbrush.pointed", tag: 1)
+                        collapsedToolButton(title: "Pen / Lasso Cutout", icon: "pencil.tip", tag: 2)
+                        collapsedToolButton(title: "Magic Wand", icon: "wand.and.stars", tag: 3)
+                        collapsedToolButton(title: "Restore Original", icon: "arrow.uturn.backward.circle", tag: 4)
+                    }
+
+                    Divider()
+                        .padding(.vertical, 2)
+
+                    // Auto Pen Path Cutout
+                    Button {
+                        viewModel.detectPenPathCandidates()
+                    } label: {
+                        Image(systemName: "lasso")
+                            .font(.system(size: 15))
+                            .frame(width: 36, height: 36)
+                            .background(
+                                Circle()
+                                    .fill(Color(NSColor.controlBackgroundColor))
+                            )
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningLumaKey || viewModel.isDetectingShape || viewModel.inFlightEdits > 0)
+                    .help("Detect Pen Path (⌘D)")
+
+                    // Luma Key
+                    Button {
+                        viewModel.runLumaKey()
+                    } label: {
+                        Image(systemName: "moon.z")
+                            .font(.system(size: 15))
+                            .frame(width: 36, height: 36)
+                            .background(
+                                Circle()
+                                    .fill(Color(NSColor.controlBackgroundColor))
+                            )
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!viewModel.hasLoadedImage || viewModel.isSaving || viewModel.isRunningLumaKey)
+                    .help("Run Luma Key")
+
+                    // Slice Mode Toggle
+                    Button {
+                        viewModel.toggleSliceMode()
+                    } label: {
+                        Image(systemName: "square.grid.3x3")
+                            .font(.system(size: 15))
+                            .foregroundStyle(viewModel.isSliceMode ? Color.accentColor : Color.primary)
+                            .frame(width: 36, height: 36)
+                            .background(
+                                Circle()
+                                    .fill(viewModel.isSliceMode ? Color.accentColor.opacity(0.2) : Color(NSColor.controlBackgroundColor))
+                            )
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Toggle Slice Grid")
+
+                    Divider()
+                        .padding(.vertical, 2)
+
+                    // Undo / Redo / Reset
+                    Button {
+                        viewModel.undo()
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 14))
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!viewModel.canUndo)
+                    .help("Undo (⌘Z)")
+
+                    Button {
+                        viewModel.redo()
+                    } label: {
+                        Image(systemName: "arrow.uturn.forward")
+                            .font(.system(size: 14))
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!viewModel.canRedo)
+                    .help("Redo (⇧⌘Z)")
+
+                    if viewModel.hasEdits {
+                        Button {
+                            viewModel.clearErase()
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.red)
+                                .frame(width: 32, height: 32)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Reset Edits")
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(NSColor.controlBackgroundColor).opacity(0.6))
+        )
+    }
+
+    private func collapsedToolButton(title: String, icon: String, tag: Int) -> some View {
+        let isSelected = viewModel.currentEditTool == tag
+        return Button {
+            viewModel.selectEditTool(tag)
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: isSelected ? .bold : .regular))
+                .foregroundStyle(isSelected ? Color.white : Color.primary)
+                .frame(width: 36, height: 36)
+                .background(
+                    Circle()
+                        .fill(isSelected ? Color.accentColor : Color.clear)
+                )
+        }
+        .buttonStyle(.borderless)
+        .help(title)
     }
 }

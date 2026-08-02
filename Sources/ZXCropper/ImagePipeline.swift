@@ -36,7 +36,9 @@ struct LoadedImage {
 }
 
 enum ImagePipeline {
-    private static let context = CIContext(options: [.cacheIntermediates: false])
+    /// Shared across all pipelines and the ShapeDetector extensions. CIContext is
+    /// thread-safe; a fresh one per operation wastes a GPU/Metal stack.
+    static let context = CIContext(options: [.cacheIntermediates: false])
 
     static func loadImage(at url: URL) throws -> LoadedImage {
         guard FileManager.default.fileExists(atPath: url.path) else {

@@ -163,7 +163,7 @@ final class ShapeDetectionTests: XCTestCase {
         XCTAssertEqual(maskValue(d.mask, at: 11, y: size - 1 - 11), 0, "detached speck is dropped")
     }
 
-    // MARK: - Mask refinement
+    // MARK: - Multi-candidate detection
 
     private func solidMask(_ size: Int, rect: CGRect) -> CGImage {
         let ctx = CGContext(
@@ -182,43 +182,68 @@ final class ShapeDetectionTests: XCTestCase {
         return ctx.makeImage()!
     }
 
-    func testMorphMaskExpandsAndShrinks() {
-        let mask = solidMask(100, rect: CGRect(x: 40, y: 40, width: 20, height: 20)) // x/y 40..59
+    func testDetectPenPathSetFindsSeparatePartsPlusCombined() {
+        // Two separated squares — a shield and a detached emblem. Detection must
+        // return both as individual candidates (largest first) AND a combined
+        // outline that encloses both.
+        let size = 100
+        let ctx = CGContext(
+            data: nil, width: size, height: size,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.setFillColor(CGColor(red: 0.07, green: 0.07, blue: 0.12, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+        ctx.setFillColor(CGColor(red: 0.9, green: 0.7, blue: 0.3, alpha: 1))
+        ctx.fill(CGRect(x: 15, y: 15, width: 45, height: 45))   // bigger part
+        ctx.fill(CGRect(x: 70, y: 60, width: 20, height: 20))   // smaller detached part
+        let image = ctx.makeImage()!
 
-        let grown = ImagePipeline.morphMask(mask, radius: 5)!
-        XCTAssertEqual(maskValue(grown, at: 37, y: 50), 255, "dilation should reach 3px outside the edge")
-        XCTAssertEqual(maskValue(grown, at: 33, y: 50), 0, "dilation should not reach 7px outside the edge")
+        // Feed the flood-fill mask directly (deterministic — no Vision model in
+        // the loop); this is the path flat game assets actually take.
+        let detection = try! ImagePipeline.detectForegroundShape(cgImage: image, tolerance: 60, keepLargest: false)
+        let set = ImagePipeline.penPathSet(fromMask: detection.mask)
+        guard let set else { return XCTFail("expected a detected path set") }
 
-        let shrunk = ImagePipeline.morphMask(mask, radius: -5)!
-        XCTAssertEqual(maskValue(shrunk, at: 41, y: 50), 0, "erosion should clear 1px inside the edge")
-        XCTAssertEqual(maskValue(shrunk, at: 50, y: 50), 255, "erosion should keep the core")
+        // Combined (candidate 1) must enclose both parts in normalized space.
+        let hull = set.combinedOuterPath
+        XCTAssertGreaterThanOrEqual(hull.count, 3)
+        let minX = hull.map(\.anchor.x).min()!
+        let maxX = hull.map(\.anchor.x).max()!
+        let minY = hull.map(\.anchor.y).min()!
+        let maxY = hull.map(\.anchor.y).max()!
+        XCTAssertLessThanOrEqual(minX, 0.16, "hull must reach the left part")
+        XCTAssertGreaterThanOrEqual(maxX, 0.88, "hull must reach the right part")
+        XCTAssertLessThanOrEqual(minY, 0.22, "hull must reach the top part")
+        XCTAssertGreaterThanOrEqual(maxY, 0.78, "hull must reach the bottom part")
+
+        // Both parts appear as separate candidates, largest first.
+        XCTAssertEqual(set.componentPaths.count, 2, "two detached parts -> two candidates")
+        let first = set.componentPaths[0]
+        let second = set.componentPaths[1]
+        let firstSpan = (first.map(\.anchor.x).max()! - first.map(\.anchor.x).min()!)
+        let secondSpan = (second.map(\.anchor.x).max()! - second.map(\.anchor.x).min()!)
+        XCTAssertGreaterThan(firstSpan, secondSpan, "components sorted by area, largest first")
     }
 
-    func testPaintShapeMaskAddAndRemove() throws {
-        let mask = solidMask(100, rect: CGRect(x: 40, y: 40, width: 20, height: 20))
-
-        // Add a stroke far outside the shape — those pixels should become subject.
-        let added = try ImagePipeline.paintShapeMask(
-            mask: mask, stroke: [CGPoint(x: 0.1, y: 0.5)],
-            brushSize: 14, brushShape: .circle, brushHardness: 1.0, add: true
-        )
-        XCTAssertEqual(maskValue(added, at: 10, y: 50), 255, "add brush should include the painted area")
-        XCTAssertEqual(maskValue(added, at: 50, y: 50), 255, "existing subject should remain")
-
-        // Remove a stroke over the shape centre — those pixels should drop out.
-        let removed = try ImagePipeline.paintShapeMask(
-            mask: mask, stroke: [CGPoint(x: 0.5, y: 0.5)],
-            brushSize: 14, brushShape: .circle, brushHardness: 1.0, add: false
-        )
-        XCTAssertEqual(maskValue(removed, at: 50, y: 50), 0, "remove brush should exclude the painted area")
-    }
-
-    func testMaskBoundingBox() {
-        let mask = solidMask(100, rect: CGRect(x: 30, y: 20, width: 40, height: 25))
-        let box = ImagePipeline.maskBoundingBox(mask)
-        XCTAssertEqual(box.minX, 30, accuracy: 1)
-        XCTAssertEqual(box.minY, 20, accuracy: 1)
-        XCTAssertEqual(box.width, 40, accuracy: 1)
-        XCTAssertEqual(box.height, 25, accuracy: 1)
+    func testDetectPenPathSetSinglePartUsesItsOwnOutlineAsCombined() {
+        // A single square subject: the combined outline must be the square itself,
+        // preserving its shape (not a hull of multiple parts).
+        let image = subjectOnDarkBackground(size: 100)
+        let detection = try! ImagePipeline.detectForegroundShape(cgImage: image, tolerance: 60, keepLargest: false)
+        guard let set = ImagePipeline.penPathSet(fromMask: detection.mask) else {
+            return XCTFail("expected a detected path set")
+        }
+        XCTAssertEqual(set.componentPaths.count, 1)
+        XCTAssertEqual(set.combinedOuterPath.count, set.componentPaths[0].count,
+                       "single-part combined == that part's outline")
+        // The combined outline sits on the 25…75 square region.
+        let xs = set.combinedOuterPath.map(\.anchor.x)
+        let ys = set.combinedOuterPath.map(\.anchor.y)
+        XCTAssertEqual(xs.min()!, 0.25, accuracy: 0.05)
+        XCTAssertEqual(xs.max()!, 0.75, accuracy: 0.05)
+        XCTAssertEqual(ys.min()!, 0.25, accuracy: 0.05)
+        XCTAssertEqual(ys.max()!, 0.75, accuracy: 0.05)
     }
 }
