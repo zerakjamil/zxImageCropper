@@ -105,6 +105,7 @@ struct RootView: View {
         .padding(16)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background {
+            WindowOnTopEnforcer()
             // Global hidden shortcut: paste an image / file with Cmd+V.
             Button("") { viewModel.pasteFromClipboard() }
                 .keyboardShortcut("v", modifiers: .command)
@@ -126,7 +127,7 @@ struct RootView: View {
                 Text("Edit Image")
                     .font(.title3.weight(.semibold))
 
-                Text(viewModel.fileName.isEmpty ? "Waiting for PNG from Finder Quick Action" : viewModel.fileName)
+                Text(viewModel.fileName.isEmpty ? "Waiting for image from Finder Quick Action" : viewModel.fileName)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -175,7 +176,7 @@ struct RootView: View {
                 shortcutRow("⌘Z / ⇧⌘Z", "Undo / Redo")
                 shortcutRow("⌘= / ⌘- / ⌘0", "Zoom in / out / reset")
                 shortcutRow("⌘V", "Paste image or file")
-                shortcutRow("Drag & drop", "Open a PNG / WebP")
+                shortcutRow("Drag & drop", "Open a PNG / JPEG / WebP")
                 shortcutRow("⌘Return / Esc", "Done / Cancel")
             }
             .font(.caption)
@@ -336,39 +337,81 @@ struct RootView: View {
                         }
 
                         if viewModel.pathCandidates.count > 1 {
-                            HStack(spacing: 6) {
+                            if viewModel.hasVFXPaths {
+                                let labels = ["Core", "Glow", "Hull"]
+                                let label = viewModel.currentCandidateIndex < labels.count
+                                    ? labels[viewModel.currentCandidateIndex]
+                                    : "Path \(viewModel.currentCandidateIndex + 1)"
+                                HStack(spacing: 6) {
+                                    Button {
+                                        viewModel.cyclePrevCandidate()
+                                    } label: {
+                                        Label("◄ Prev", systemImage: "chevron.backward")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .font(.caption)
+                                    .help("Previous VFX path")
+
+                                    Text("\(label) \(viewModel.currentCandidateIndex + 1) of \(viewModel.pathCandidates.count) ")
+                                        .font(.caption2)
+                                        .frame(maxWidth: .infinity)
+
+                                    Button {
+                                        viewModel.cycleNextCandidate()
+                                    } label: {
+                                        Label("Next ►", systemImage: "chevron.forward")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .font(.caption)
+                                    .help("Next VFX path")
+                                }
+
+                                VStack(spacing: 2) {
+                                    Text("Expansion: \(String(format: "%.0f", viewModel.shapeExpansion))%")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Slider(value: $viewModel.shapeExpansion, in: -50...100, step: 1)
+                                        .help("Expand outward to cover more glow halo, or contract inward to tighten to the core.")
+                                }
+                                .onChange(of: viewModel.shapeExpansion) { _ in
+                                    viewModel.applyExpansion()
+                                }
+
+                            } else {
+                                HStack(spacing: 6) {
+                                    Button {
+                                        viewModel.cyclePrevCandidate()
+                                    } label: {
+                                        Label("◄ Prev", systemImage: "chevron.backward")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .font(.caption)
+                                    .help("Previous detected part")
+
+                                    Text("Shape \(viewModel.currentCandidateIndex + 1) of \(viewModel.pathCandidates.count)")
+                                        .font(.caption2)
+                                        .frame(maxWidth: .infinity)
+
+                                    Button {
+                                        viewModel.cycleNextCandidate()
+                                    } label: {
+                                        Label("Next ►", systemImage: "chevron.forward")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .font(.caption)
+                                    .help("Next detected part")
+                                }
+
                                 Button {
-                                    viewModel.cyclePrevCandidate()
+                                    viewModel.selectCombinedOuterPath()
                                 } label: {
-                                    Label("◄ Prev", systemImage: "chevron.backward")
+                                    Label("Full Logo (Combined Boundary)", systemImage: "rectangle.inset.filled")
+                                        .frame(maxWidth: .infinity)
                                 }
                                 .buttonStyle(.bordered)
                                 .font(.caption)
-                                .help("Previous detected part")
-
-                                Text("Shape \(viewModel.currentCandidateIndex + 1) of \(viewModel.pathCandidates.count)")
-                                    .font(.caption2)
-                                    .frame(maxWidth: .infinity)
-
-                                Button {
-                                    viewModel.cycleNextCandidate()
-                                } label: {
-                                    Label("Next ►", systemImage: "chevron.forward")
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                .help("Next detected part")
+                                .help("Jump back to the outline that encloses every part.")
                             }
-
-                            Button {
-                                viewModel.selectCombinedOuterPath()
-                            } label: {
-                                Label("Full Logo (Combined Boundary)", systemImage: "rectangle.inset.filled")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
-                            .font(.caption)
-                            .help("Jump back to the outline that encloses every part.")
                         }
 
                         Text("Then use the Pen tool (⌘3): drag dots to refine, click a segment's dot to add one, or cut with Erase Inside / Keep Inside.")
@@ -1109,7 +1152,7 @@ struct RootView: View {
                 Text("Launch from Finder")
                     .font(.headline)
 
-                Text("Right-click a PNG / WebP file and run Quick Action: Edit Image")
+                Text("Right-click an image (PNG, JPEG, WebP) and run Quick Action: Edit Image")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }

@@ -59,6 +59,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
             <key>NSSendFileTypes</key>
             <array>
                 <string>public.png</string>
+                <string>public.jpeg</string>
                 <string>org.webmproject.webp</string>
             </array>
             <key>NSUserInterfaceType</key>
@@ -82,6 +83,18 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
             <key>LSItemContentTypes</key>
             <array>
                 <string>public.png</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>JPEG Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Default</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.jpeg</string>
             </array>
         </dict>
         <dict>

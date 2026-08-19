@@ -1,6 +1,6 @@
 # ZXImageCropper (ZXCropper)
 
-Fast, native macOS image editor for PNG files, launched directly from Finder with a right-click Quick Action named **Edit Image**.
+Fast, native macOS image editor for PNG, JPEG, and WebP files, launched directly from Finder with a right-click Quick Action named **Edit Image**.
 
 ## What This App Solves
 
@@ -11,22 +11,21 @@ ZXImageCropper is designed for speed-first edits when you do not want to open a 
 - Preserve safety by auto-creating backups
 - Overwrite the original only after successful processing
 
-## v1 Scope
+## Scope
 
-Included in v1:
+Included:
 
 - Single file selection from Finder
-- PNG input/output
+- PNG, JPEG (.jpg / .jpeg), and WebP input/output
 - Crop with free mode + aspect presets
 - Side and corner handle resizing for precise alignment
 - Numeric resize output fields
 - Backup + overwrite flow
 
-Excluded in v1:
+Excluded:
 
 - RAW formats
 - Batch editing
-- Filters and effects
 - Metadata editing UI
 
 ## Requirements
@@ -54,7 +53,7 @@ Install command line tools if needed:
 
 4. Use in Finder:
 
-   - Right-click a PNG
+   - Right-click an image (PNG, JPEG, or WebP)
    - Choose Quick Actions -> Edit Image
    - Crop/resize
    - Press Done
@@ -64,7 +63,7 @@ Install command line tools if needed:
 When you run **Edit Image**:
 
 1. App opens in front of other windows.
-2. Selected PNG is loaded from launch argument.
+2. Selected image is loaded from launch argument.
 3. You adjust crop and output size.
 4. Press Done to save.
 5. App creates backup, overwrites original safely, and auto-closes.
@@ -83,7 +82,7 @@ This interaction model is hardened for unstable mouse press/hold behavior.
 
 - Width and Height fields accept numeric values only
 - Preview updates off-main-thread for responsiveness
-- Large PNG files remain interactive during preview recompute
+- Large image files remain interactive during preview recompute
 
 ## Keyboard Shortcuts
 
@@ -102,7 +101,7 @@ On Done:
 
 Backup naming:
 
-- <name>.backup-YYYYMMDD-HHMMSS-SSS.png
+- `<name>.backup-YYYYMMDD-HHMMSS-SSS.<ext>`
 - Collision-safe suffix is added when needed
 
 On Cancel:

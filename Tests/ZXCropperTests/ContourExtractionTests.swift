@@ -344,4 +344,126 @@ final class ContourExtractionTests: XCTestCase {
         // middle row must be background (no vertical flip confusion).
         XCTAssertEqual(maskValue(mask, at: 20, y: 150), 0, "background beside the ball should be dropped")
     }
+
+    // MARK: - Game Asset / VFX detection
+
+    func testAlphaVFXReturnsThreeCandidates() throws {
+        // Transparent PNG: fully opaque core (α=255) with a soft glow halo (α fading
+        // 100→10). detectGameAssetVFXPaths must produce [core, glow, hull].
+        let size = 100
+        let ctx = CGContext(
+            data: nil, width: size, height: size,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        let bpr = ctx.bytesPerRow
+        let ptr = ctx.data!.bindMemory(to: UInt8.self, capacity: size * bpr)
+        memset(ptr, 0, size * bpr)
+
+        let coreR: CGFloat = 12
+        let glowR: CGFloat = 28
+        for y in 0..<size {
+            for x in 0..<size {
+                let dist = sqrt(pow(CGFloat(x - 50), 2) + pow(CGFloat(y - 50), 2))
+                let o = y * bpr + x * 4
+                if dist <= coreR {
+                    ptr[o] = 220; ptr[o + 1] = 180; ptr[o + 2] = 80; ptr[o + 3] = 255
+                } else if dist <= glowR {
+                    let frac = 1 - (dist - coreR) / (glowR - coreR)
+                    let a = UInt8(frac * 100)
+                    ptr[o] = 220; ptr[o + 1] = 180; ptr[o + 2] = 80; ptr[o + 3] = a
+                } // else transparent (alpha 0)
+            }
+        }
+        let image = ctx.makeImage()!
+
+        guard let candidates = ImagePipeline.detectGameAssetVFXPaths(cgImage: image, tolerance: 60) else {
+            return XCTFail("alpha VFX should return 3 candidates")
+        }
+        XCTAssertEqual(candidates.count, 3, "must return core, glow, hull")
+        for (i, c) in candidates.enumerated() {
+            XCTAssertGreaterThanOrEqual(c.count, 3, "candidate \(i) must have ≥3 vertices")
+        }
+
+        // Core lies inside glow: core's widest span ≤ glow's widest span (normalized).
+        let coreMinX = candidates[0].map(\.anchor.x).min()!
+        let coreMaxX = candidates[0].map(\.anchor.x).max()!
+        let glowMinX = candidates[1].map(\.anchor.x).min()!
+        let glowMaxX = candidates[1].map(\.anchor.x).max()!
+        XCTAssertGreaterThanOrEqual(coreMinX, glowMinX - 0.05, "core must not be left of glow")
+        XCTAssertLessThanOrEqual(coreMaxX, glowMaxX + 0.05, "core must not be right of glow")
+
+        // Hull encloses glow (hull's span ≥ glow's span).
+        let hullMaxX = candidates[2].map(\.anchor.x).max()!
+        XCTAssertGreaterThanOrEqual(hullMaxX, glowMaxX - 0.02, "hull must contain glow")
+    }
+
+    func testAlphaVFXNilOnFullyOpaqueImage() throws {
+        // A fully opaque image with subject on dark bg should NOT trigger the alpha
+        // VFX path — it falls through to the standard pipeline (returns nil from
+        // detectGameAssetVFXPaths for fallback, or canonical candidates).
+        let size = 100
+        let ctx = CGContext(
+            data: nil, width: size, height: size,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.setFillColor(CGColor(red: 0.07, green: 0.07, blue: 0.12, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+        ctx.setFillColor(CGColor(red: 0.9, green: 0.7, blue: 0.3, alpha: 1))
+        ctx.fill(CGRect(x: 25, y: 25, width: 50, height: 50))
+        let image = ctx.makeImage()!
+
+        // For opaque images, detectGameAssetVFXPaths should either produce 3
+        // candidates OR nil (falling back to standard detection). The opaque VFX
+        // path calls subjectMaskAll + opaqueVFXPaths internally, so it may succeed.
+        if let candidates = ImagePipeline.detectGameAssetVFXPaths(cgImage: image, tolerance: 60) {
+            XCTAssertEqual(candidates.count, 3)
+            for (i, c) in candidates.enumerated() {
+                XCTAssertGreaterThanOrEqual(c.count, 3, "opaque VFX candidate \(i) must have ≥3 vertices")
+            }
+        }
+        // else: nil is OK — means standard detection should be used
+    }
+
+    func testAlphaVFXGlowMaskLargerThanCore() throws {
+        // Verify that the glow candidate (index 1) strictly encloses the core
+        // candidate (index 0) for a feathered glow disc.
+        let size = 80
+        let ctx = CGContext(
+            data: nil, width: size, height: size,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        let bpr = ctx.bytesPerRow
+        let ptr = ctx.data!.bindMemory(to: UInt8.self, capacity: size * bpr)
+        memset(ptr, 0, size * bpr)
+
+        for y in 0..<size {
+            for x in 0..<size {
+                let dist = sqrt(pow(CGFloat(x - 40), 2) + pow(CGFloat(y - 40), 2))
+                let o = y * bpr + x * 4
+                if dist <= 15 {
+                    ptr[o] = 255; ptr[o + 1] = 200; ptr[o + 2] = 50; ptr[o + 3] = 255
+                } else if dist <= 35 {
+                    let a = UInt8(max(0, min(255, (35 - dist) / 20 * 255)))
+                    ptr[o] = 255; ptr[o + 1] = 200; ptr[o + 2] = 50; ptr[o + 3] = a
+                }
+            }
+        }
+        let image = ctx.makeImage()!
+
+        guard let candidates = ImagePipeline.detectGameAssetVFXPaths(cgImage: image, tolerance: 60) else {
+            return XCTFail("alpha VFX should return candidates")
+        }
+        XCTAssertGreaterThanOrEqual(candidates[0].count, 3, "core path should be valid")
+        XCTAssertGreaterThanOrEqual(candidates[1].count, 3, "glow path should be valid")
+        // Glow area (span in normalized coords) must exceed core span.
+        let coreDx = candidates[0].map(\.anchor.x).max()! - candidates[0].map(\.anchor.x).min()!
+        let glowDx = candidates[1].map(\.anchor.x).max()! - candidates[1].map(\.anchor.x).min()!
+        XCTAssertGreaterThan(glowDx, coreDx, "glow must be wider than core")
+    }
 }

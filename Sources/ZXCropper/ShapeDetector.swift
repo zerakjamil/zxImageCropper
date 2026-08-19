@@ -683,6 +683,13 @@ extension ImagePipeline {
             let refined = refineMask(detection.mask, source: cgImage)
             if isUsableSubjectMask(refined) { return refined }
         }
+        // Step 2a — local Otsu on the central region. Catches starburst flares
+        // whose rays touch the border (flood collapses full-frame), plus emissive
+        // VFX where luminance thresholding isolates the core where the flood can't.
+        if let local = localOtsuMask(cgImage: cgImage) {
+            let refined = refineMask(local, source: cgImage)
+            if isUsableSubjectMask(refined) { return refined }
+        }
         // Step 3 — saliency alone (flood threw or emptied, e.g. the prior covered
         // the entire border so no background palette survived).
         if let prior {
@@ -1511,5 +1518,317 @@ extension ImagePipeline {
         }
 
         return DetectedPathSet(combinedOuterPath: combined, componentPaths: componentPaths)
+    }
+
+    // MARK: - Game Asset & VFX Contour Engine
+
+    /// Generates 3 candidate pen paths for game assets, VFX flares, glowing icons,
+    /// and translucent shapes:
+    ///   1. Core object contour (tight) — the solid emissive centre.
+    ///   2. Outer glow / aura path — encloses the full soft glow / translucent edge.
+    ///   3. Smooth convex hull — encloses all spikes, wing tips, and flare points.
+    ///
+    /// For transparent PNGs the candidates come from alpha-only extraction; for
+    /// opaque glow images the existing subject mask is reused with radial luminance
+    /// falloff to locate the solid core. Returns nil when no usable 3-candidate set
+    /// can be produced.
+    static func detectGameAssetVFXPaths(cgImage: CGImage, tolerance: CGFloat) -> [[PolygonVertex]]? {
+        let width = cgImage.width, height = cgImage.height
+        guard width > 1, height > 1 else { return nil }
+
+        // Alpha asset path — the alpha channel is authoritative.
+        if hasSignificantAlpha(cgImage) { return alphaVFXPaths(cgImage: cgImage) }
+
+        // Opaque path: reuse the existing subject detection and generate 3 candidates.
+        guard let mask = subjectMaskAll(cgImage: cgImage, tolerance: tolerance) else { return nil }
+        let w = mask.width, h = mask.height
+        guard w > 1, h > 1 else { return nil }
+
+        // Candidate 2: outer glow = the mask contour itself.
+        let glowRing = contourPoints(from: mask)
+        guard glowRing.count >= 3 else { return nil }
+        let glowPath = simplifyRing(glowRing, maxPoints: 80, width: w, height: h)
+        guard glowPath.count >= 3 else { return nil }
+
+        // Candidate 1: core via radial luminance falloff, or erosion fallback.
+        let coreRing = radialLuminanceCore(source: cgImage, subjectMask: mask, outerGlowRing: glowRing)
+            ?? erodeToCore(mask, width: w, height: h)
+        guard let coreRing, coreRing.count >= 3 else { return nil }
+        let corePath = simplifyRing(coreRing, maxPoints: 80, width: w, height: h)
+        guard corePath.count >= 3 else { return nil }
+
+        // Candidate 3: convex hull of the raw glow boundary.
+        var hullPath = glowPath
+        if let hull = convexHull(glowRing) {
+            let hullN = simplifyRing(hull, maxPoints: 80, width: w, height: h)
+            if hullN.count >= 3 { hullPath = hullN }
+        }
+
+        let toVerts: ([CGPoint]) -> [PolygonVertex] = { $0.map { PolygonVertex(anchor: $0, controlIn: nil, controlOut: nil) } }
+        // ponytail: both alpha and opaque paths produce candidates in the same order
+        // (core, outer-glow, hull) so the caller always presents them identically.
+        return [toVerts(corePath), toVerts(glowPath), toVerts(hullPath)]
+    }
+
+    /// Returns true when more than 1% of sampled pixels carry semi-transparent
+    /// alpha (< 250 out of 255). Stratified sampling for speed.
+    private static func hasSignificantAlpha(_ cgImage: CGImage) -> Bool {
+        guard let d = cgImage.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return false }
+        let bpr = cgImage.bytesPerRow, w = cgImage.width, h = cgImage.height
+        let step = max(4, min(w, h) / 60)
+        var semi = 0, total = 0
+        for y in stride(from: 0, to: h, by: step) {
+            for x in stride(from: 0, to: w, by: step) {
+                if p[y * bpr + x * 4 + 3] < 250 { semi += 1 }
+                total += 1
+            }
+        }
+        return total > 0 && Double(semi) / Double(total) > 0.01
+    }
+
+    /// Generates 3 candidates from the alpha channel: core (α > 0.50), full glow
+    /// (α > 0.05), and convex hull of the full glow.
+    private static func alphaVFXPaths(cgImage: CGImage) -> [[PolygonVertex]]? {
+        let w = cgImage.width, h = cgImage.height
+        guard let coreMask = alphaKeepMask(cgImage: cgImage, threshold: 127),
+              let glowMask = alphaKeepMask(cgImage: cgImage, threshold: 12) else { return nil }
+
+        let coreRing = contourPoints(from: coreMask)
+        let glowRing = contourPoints(from: glowMask)
+        guard coreRing.count >= 3, glowRing.count >= 3 else { return nil }
+
+        let corePath = simplifyRing(coreRing, maxPoints: 80, width: w, height: h)
+        let glowPath = simplifyRing(glowRing, maxPoints: 80, width: w, height: h)
+        guard corePath.count >= 3, glowPath.count >= 3 else { return nil }
+
+        var hullPath = glowPath
+        if let hull = convexHull(glowRing) {
+            let hullN = simplifyRing(hull, maxPoints: 80, width: w, height: h)
+            if hullN.count >= 3 { hullPath = hullN }
+        }
+
+        let toVerts: ([CGPoint]) -> [PolygonVertex] = { $0.map { PolygonVertex(anchor: $0, controlIn: nil, controlOut: nil) } }
+        return [toVerts(corePath), toVerts(glowPath), toVerts(hullPath)]
+    }
+
+    /// Builds a binary keep-mask (255 = keep) from the alpha channel of `cgImage`.
+    private static func alphaKeepMask(cgImage: CGImage, threshold: Int) -> CGImage? {
+        let w = cgImage.width, h = cgImage.height
+        guard let d = cgImage.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return nil }
+        let bpr = cgImage.bytesPerRow
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ), let data = ctx.data else { return nil }
+        let dst = data.bindMemory(to: UInt8.self, capacity: h * w)
+        for y in 0..<h {
+            let row = y * bpr
+            for x in 0..<w { dst[y * w + x] = p[row + x * 4 + 3] > threshold ? 255 : 0 }
+        }
+        return ctx.makeImage()
+    }
+
+    /// Finds the solid core boundary of a glowing object by casting rays from the
+    /// mask centroid outward and locating the steepest negative luminance drop along
+    /// each ray. Returns a raw pixel-space ring, or nil when too few rays yield a
+    /// convincing core boundary (the caller falls back to `erodeToCore`).
+    ///
+    /// For a glowing icon / VFX flare the luminance profile from centre → edge is
+    /// [bright plateau → steep drop → soft glow → background]. The drop is the
+    /// solid object's edge; the soft glow beyond is the visible aura.
+    ///
+    /// ponytail: uses the outer glow ring to locate the mask edge for each ray,
+    /// samples luminance at ~10 intervals between centroid and that edge, and picks
+    /// the steepest negative 2-point slope. A minimum slope of -1 prevents picking
+    /// up flat-region noise; rays where no convincing drop exists fall back to a
+    /// fixed fraction (0.6× mask-edge distance) of the centroid-to-edge span.
+    private static func radialLuminanceCore(source: CGImage, subjectMask: CGImage, outerGlowRing: [CGPoint]) -> [CGPoint]? {
+        let width = source.width, height = source.height
+        guard width > 1, height > 1 else { return nil }
+
+        // Source luminance.
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let data = ctx.data else { return nil }
+        ctx.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let bpr = ctx.bytesPerRow
+        let ptr = data.bindMemory(to: UInt8.self, capacity: height * bpr)
+
+        var lum = [UInt8](repeating: 0, count: width * height)
+        for y in 0..<height {
+            let row = y * bpr
+            for x in 0..<width {
+                let o = row + x * 4
+                let r = Int(ptr[o]), g = Int(ptr[o + 1]), b = Int(ptr[o + 2])
+                lum[y * width + x] = UInt8((77 * r + 150 * g + 29 * b) >> 8)
+            }
+        }
+
+        // Compute mask centroid.
+        guard let md = subjectMask.dataProvider?.data, let mp = CFDataGetBytePtr(md) else { return nil }
+        let mbpr = subjectMask.bytesPerRow
+        var sx = 0, sy = 0, scount = 0
+        for y in 0..<min(height, subjectMask.height) {
+            let row = y * mbpr
+            for x in 0..<min(width, subjectMask.width) where mp[row + x] > 127 {
+                sx += x; sy += y; scount += 1
+            }
+        }
+        guard scount > 0 else { return nil }
+        let cx = CGFloat(sx) / CGFloat(scount)
+        let cy = CGFloat(sy) / CGFloat(scount)
+
+        // Build a direction→mask-boundary-distance map from the outer-glow ring:
+        // for each ray angle, find the intersection of the ray from centroid with
+        // the glow ring. This is the mask edge for that ray.
+        let numRays = 120
+        var ringDist = [CGFloat](repeating: 0, count: numRays)
+        for ri in 0..<numRays {
+            let angle = 2.0 * Double.pi * Double(ri) / Double(numRays)
+            let dx = cos(angle), dy = sin(angle)
+            var bestDist = CGFloat.greatestFiniteMagnitude
+            for p in outerGlowRing {
+                let vx = p.x - cx, vy = p.y - cy
+                let proj = vx * CGFloat(dx) + vy * CGFloat(dy)
+                if proj <= 0 { continue } // behind centroid
+                let perpDist = abs(vx * CGFloat(-dy) + vy * CGFloat(dx))
+                if perpDist < 2.0, proj < bestDist { bestDist = proj }
+            }
+            ringDist[ri] = bestDist < CGFloat.greatestFiniteMagnitude ? bestDist : 0
+        }
+
+        // Walk each ray from centroid outward, find steepest negative 2-point slope.
+        var boundaryPts = [CGPoint]()
+        let minSlope: Double = -1.0 // below this is a real drop
+        for ri in 0..<numRays where ringDist[ri] > 3 {
+            let angle = 2.0 * Double.pi * Double(ri) / Double(numRays)
+            let dx = cos(angle), dy = sin(angle)
+            let endT = max(3, Int(ringDist[ri]) + 3) // a few px past mask edge
+
+            var bestSlope = 0.0
+            var bestT: Int? = nil
+            var prevLum = -1
+
+            for t in 0..<endT {
+                let tx = Int(cx + CGFloat(t) * dx), ty = Int(cy + CGFloat(t) * dy)
+                guard tx >= 0, tx < width, ty >= 0, ty < height else { break }
+                let curLum = Int(lum[ty * width + tx])
+                if prevLum >= 0 {
+                    let slope = Double(curLum - prevLum)
+                    if slope < bestSlope { bestSlope = slope; bestT = t }
+                }
+                prevLum = curLum
+            }
+
+            let hitT: Int
+            if let bestT, bestSlope < minSlope {
+                hitT = bestT
+            } else {
+                // No convincing drop — use a fraction of the mask-edge distance.
+                hitT = Int(CGFloat(endT) * 0.55)
+            }
+            let px = cx + CGFloat(hitT) * dx
+            let py = cy + CGFloat(hitT) * dy
+            if px >= 0, px <= CGFloat(width), py >= 0, py <= CGFloat(height) {
+                boundaryPts.append(CGPoint(x: px, y: py))
+            }
+        }
+
+        guard boundaryPts.count >= 3 else { return nil }
+        return boundaryPts
+    }
+
+    /// Fallback core extraction: binary-erode the mask until at most ~70 % of the
+    /// original subject area remains, then contour-trace. Used when radial luminance
+    /// falloff doesn't produce a convincing core (e.g. flat-colour logo on opaque).
+    private static func erodeToCore(_ mask: CGImage, width: Int, height: Int) -> [CGPoint]? {
+        guard let d = mask.dataProvider?.data, let p = CFDataGetBytePtr(d) else { return nil }
+        let bpr = mask.bytesPerRow
+        let total = width * height
+        var buf = [UInt8](repeating: 0, count: total)
+        for y in 0..<height {
+            let row = y * bpr
+            for x in 0..<width { buf[y * width + x] = p[row + x] }
+        }
+        let origCount = buf.filter { $0 > 127 }.count
+        guard origCount > 10 else { return nil }
+        let target = Int(Double(origCount) * 0.70)
+
+        var radius = 1
+        while radius <= 6 {
+            let eroded = binaryErode(buf, width: width, height: height, radius: radius)
+            let kept = eroded.filter { $0 > 127 }.count
+            if kept <= target || kept < 10 { break }
+            radius += 1
+        }
+        let eroded = radius == 1 ? buf : binaryErode(buf, width: width, height: height, radius: max(1, radius - 1))
+        return contourPoints(fromFG: eroded.map { $0 > 127 }, width: width, height: height)
+    }
+
+    /// Local Otsu / adaptive thresholding focused on the central ~60% region of the
+    /// image. Computes a luminance Otsu threshold within the centered crop, then
+    /// applies it globally to produce a keep-mask. Catches starburst flares and
+    /// central-emitter VFX where the flood path fails because rays touch the canvas
+    /// border.
+    ///
+    /// ponytail: no sliding window or multi-region analysis. A single Otsu on the
+    /// central crop recovers the core starburst emblem, which is the only pattern
+    /// that matters here — full-frame flood collapse from border-touching rays.
+    private static func localOtsuMask(cgImage: CGImage) -> CGImage? {
+        let width = cgImage.width, height = cgImage.height
+        guard width > 40, height > 40 else { return nil }
+
+        // Build full-size luminance buffer once, then compute Otsu on the centre crop.
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let data = ctx.data else { return nil }
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let bpr = ctx.bytesPerRow
+        let ptr = data.bindMemory(to: UInt8.self, capacity: height * bpr)
+
+        var lum = [UInt8](repeating: 0, count: width * height)
+        for y in 0..<height {
+            let row = y * bpr
+            for x in 0..<width {
+                let o = row + x * 4
+                let r = Int(ptr[o]), g = Int(ptr[o + 1]), b = Int(ptr[o + 2])
+                lum[y * width + x] = UInt8((77 * r + 150 * g + 29 * b) >> 8)
+            }
+        }
+
+        // Central 60 % crop for Otsu statistics.
+        let cx = width / 2, cy = height / 2
+        let cropW = Int(CGFloat(width) * 0.6), cropH = Int(CGFloat(height) * 0.6)
+        let ox = cx - cropW / 2, oy = cy - cropH / 2
+        guard cropW > 10, cropH > 10 else { return nil }
+
+        var hist = [Int](repeating: 0, count: 256)
+        var localTotal = 0
+        for y in oy..<(oy + cropH) {
+            guard y >= 0, y < height else { continue }
+            for x in ox..<(ox + cropW) {
+                guard x >= 0, x < width else { continue }
+                let v = Int(lum[y * width + x])
+                hist[min(max(v, 0), 255)] += 1
+                localTotal += 1
+            }
+        }
+        guard localTotal > 0 else { return nil }
+        let t = otsuThreshold(histogram: hist, total: localTotal)
+        // Otsu class-2 = brighter pixels (v > t). For a starburst on dark bg the
+        // bright pixels are the core emblem — exactly what we want.
+
+        var keep = [UInt8](repeating: 0, count: width * height)
+        for i in 0..<width * height where Int(lum[i]) > t { keep[i] = 255 }
+        guard let result = try? buildMaskResult(keep, width: width, height: height) else { return nil }
+        return isUsableSubjectMask(result.mask) ? result.mask : nil
     }
 }

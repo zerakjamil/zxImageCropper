@@ -120,6 +120,14 @@ final class EditorViewModel: ObservableObject {
     /// the rest are individual parts, largest first.
     @Published var pathCandidates: [[PolygonVertex]] = []
     @Published var currentCandidateIndex: Int = 0
+    /// True when the current pathCandidates came from the VFX engine (3 paths:
+    /// core, glow, hull) instead of component-based detection.
+    @Published var hasVFXPaths = false
+    /// Real-time expansion/contraction factor applied on top of the base VFX
+    /// candidates. Positive = inflate to cover more glow; negative = tighten to
+    /// the core. The base vertices in pathCandidates are never modified — the
+    /// display path (`polygonVertices`) is recomputed from the slider value.
+    @Published var shapeExpansion: CGFloat = 0
     @Published var isSpriteBoxEditMode = false
     /// Number of bake operations currently in flight. Gates undo/redo/save so the
     /// snapshot history can't be mutated underneath an outstanding bake.
@@ -752,37 +760,64 @@ final class EditorViewModel: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let set = ImagePipeline.detectPenPathSet(cgImage: base, tolerance: tolerance)
+
+            // Try VFX detection first (generates 3 candidates: core, glow, hull
+            // from alpha or radial luminance falloff). Falls back to standard
+            // component-based detection when the image isn't a VFX asset.
+            let vfx = ImagePipeline.detectGameAssetVFXPaths(cgImage: base, tolerance: tolerance)
+
             DispatchQueue.main.async {
                 guard generation == self.shapeDetectionGeneration else { return }
                 self.isDetectingShape = false
-                guard let set, !set.componentPaths.isEmpty else {
-                    self.errorMessage = "Could not detect a subject outline. Try a clearer image or adjust the tolerance."
-                    return
+
+                if let vfx, vfx.count >= 3, vfx.allSatisfy({ $0.count >= 3 }) {
+                    // VFX candidates: [core, glow, hull]
+                    self.hasVFXPaths = true
+                    self.pathCandidates = vfx
+                    self.currentCandidateIndex = 0
+                    self.shapeExpansion = 0
+                    self.selectEditTool(2)
+                    self.penShape = .free
+                    self.vertexUndoStack.append(
+                        PolygonHistoryEntry(vertices: self.polygonVertices, isClosed: self.isPolygonClosed)
+                    )
+                    self.vertexRedoStack.removeAll()
+                    self.polygonVertices = vfx[0]
+                    self.isPolygonClosed = true
+                    if self.penSmooth { self.recomputeSmoothHandles() }
+                    self.infoMessage = "VFX paths ready — Core / Glow / Hull via ◄ Prev / Next ►; adjust Expansion for halo coverage."
+                } else {
+                    // Standard component-based detection.
+                    self.hasVFXPaths = false
+                    let set = ImagePipeline.detectPenPathSet(cgImage: base, tolerance: tolerance)
+                    guard let set, !set.componentPaths.isEmpty else {
+                        self.errorMessage = "Could not detect a subject outline. Try a clearer image or adjust the tolerance."
+                        return
+                    }
+                    // A single part's combined outline IS that part, so dedup it —
+                    // otherwise the nav shows a fake "Shape 1 of 2 / Shape 2 of 2".
+                    let candidates = [set.combinedOuterPath] + set.componentPaths.filter { $0 != set.combinedOuterPath }
+                    guard candidates.first?.count ?? 0 >= 3 else {
+                        self.errorMessage = "The detected outlines were too small to use as pen paths."
+                        return
+                    }
+                    self.pathCandidates = candidates
+                    self.currentCandidateIndex = 0
+                    self.selectEditTool(2)
+                    self.penShape = .free
+                    // Record the pre-detect path (normally empty) so ⌘Z removes the
+                    // generated path; redo restores it.
+                    self.vertexUndoStack.append(
+                        PolygonHistoryEntry(vertices: self.polygonVertices, isClosed: self.isPolygonClosed)
+                    )
+                    self.vertexRedoStack.removeAll()
+                    self.polygonVertices = candidates[0]
+                    self.isPolygonClosed = true
+                    if self.penSmooth { self.recomputeSmoothHandles() }
+                    self.infoMessage = candidates.count > 1
+                        ? "Outline ready — ◄ Prev / Next ► to pick a part, or drag dots to refine, then cut."
+                        : "Outline ready — drag dots or lines to refine, then Erase Inside or Keep Inside."
                 }
-                // A single part's combined outline IS that part, so dedup it —
-                // otherwise the nav shows a fake "Shape 1 of 2 / Shape 2 of 2".
-                let candidates = [set.combinedOuterPath] + set.componentPaths.filter { $0 != set.combinedOuterPath }
-                guard candidates.first?.count ?? 0 >= 3 else {
-                    self.errorMessage = "The detected outlines were too small to use as pen paths."
-                    return
-                }
-                self.pathCandidates = candidates
-                self.currentCandidateIndex = 0
-                self.selectEditTool(2)
-                self.penShape = .free
-                // Record the pre-detect path (normally empty) so ⌘Z removes the
-                // generated path; redo restores it.
-                self.vertexUndoStack.append(
-                    PolygonHistoryEntry(vertices: self.polygonVertices, isClosed: self.isPolygonClosed)
-                )
-                self.vertexRedoStack.removeAll()
-                self.polygonVertices = candidates[0]
-                self.isPolygonClosed = true
-                if self.penSmooth { self.recomputeSmoothHandles() }
-                self.infoMessage = candidates.count > 1
-                    ? "Outline ready — ◄ Prev / Next ► to pick a part, or drag dots to refine, then cut."
-                    : "Outline ready — drag dots or lines to refine, then Erase Inside or Keep Inside."
             }
         }
     }
@@ -815,6 +850,28 @@ final class EditorViewModel: ObservableObject {
         polygonVertices = verts
         isPolygonClosed = true
         if penSmooth { recomputeSmoothHandles() }
+        if hasVFXPaths { applyExpansion() }
+    }
+
+    /// Inflates / contracts the current VFX candidate's vertices from their centroid
+    /// by `(1 + shapeExpansion / 100)`. Called on every slider drag (from `.onChange`
+    /// in the view) and on candidate switch. Does NOT modify the stored candidate
+    /// — only the display path.
+    func applyExpansion() {
+        guard hasVFXPaths, !pathCandidates.isEmpty, shapeExpansion != 0 else { return }
+        let base = pathCandidates[currentCandidateIndex]
+        guard base.count >= 3 else { return }
+        var sx: CGFloat = 0, sy: CGFloat = 0
+        for v in base { sx += v.anchor.x; sy += v.anchor.y }
+        let cx = sx / CGFloat(base.count), cy = sy / CGFloat(base.count)
+        let scale = 1 + shapeExpansion / 100
+        polygonVertices = base.map { v in
+            var copy = v
+            copy.anchor = CGPoint(x: cx + (v.anchor.x - cx) * scale, y: cy + (v.anchor.y - cy) * scale)
+            return copy
+        }
+        isPolygonClosed = true
+        if penSmooth { recomputeSmoothHandles() }
     }
 
     func clearShapeDetection() {
@@ -822,6 +879,8 @@ final class EditorViewModel: ObservableObject {
         isDetectingShape = false
         if !pathCandidates.isEmpty { pathCandidates = [] }
         currentCandidateIndex = 0
+        hasVFXPaths = false
+        shapeExpansion = 0
     }
 
     /// Sets the crop rectangle to a pixel-space bounding box (top-left origin) with
@@ -1921,7 +1980,7 @@ final class EditorViewModel: ObservableObject {
 
     private func loadFromLaunchPath() {
         guard let launchImagePath, !launchImagePath.isEmpty else {
-            errorMessage = "No image path was received. Launch this app from Finder Quick Action: Edit Image, or drag a PNG/WebP onto the window."
+            errorMessage = "No image path was received. Launch this app from Finder Quick Action: Edit Image, or drag an image (PNG, JPEG, WebP) onto the window."
             return
         }
 

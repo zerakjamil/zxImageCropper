@@ -45,6 +45,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
             <key>NSSendFileTypes</key>
             <array>
                 <string>public.png</string>
+                <string>public.jpeg</string>
                 <string>org.webmproject.webp</string>
             </array>
         </dict>
@@ -145,19 +146,14 @@ if [[ -z "$input_file" ]]; then
     exit 0
 fi
 
-/usr/bin/open -na "$app_path" --args "$input_file"
+/usr/bin/open -a "$app_path" --args "$input_file"
+/usr/bin/open "$input_file" -a "$app_path" 2>/dev/null || true
 
 /usr/bin/osascript \
-    -e 'repeat 30 times' \
     -e 'try' \
     -e 'tell application id "com.zxcropper.app" to activate' \
     -e 'end try' \
-    -e 'try' \
-    -e 'tell application "System Events" to tell process "ZXCropper" to set frontmost to true' \
-    -e 'end try' \
-    -e 'delay 0.08' \
-    -e 'end repeat' \
-    >/dev/null || true</string>
+    >/dev/null 2>&amp;1 || true</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
                     <key>inputMethod</key>

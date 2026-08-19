@@ -27,6 +27,7 @@ struct ZXCropperApp: App {
                     appDelegate.onOpenFile = { [weak viewModel] url in
                         viewModel?.handleOpenFile(at: url)
                     }
+                    appDelegate.focusEditorWindows(ignoringOtherApps: true)
                 }
         }
         .windowToolbarStyle(.unifiedCompact)

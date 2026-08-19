@@ -9,6 +9,7 @@ enum PipelineError: LocalizedError {
     case unsupportedFormat
     case unableToLoadImage
     case renderFailed
+    case imageEncodingFailed
     case pngEncodingFailed
 
     var errorDescription: String? {
@@ -18,13 +19,13 @@ enum PipelineError: LocalizedError {
         case .permissionDenied:
             return "Permission denied. Grant folder access and try again."
         case .unsupportedFormat:
-            return "Supports PNG and WebP files only."
+            return "Supports PNG, JPEG, and WebP files only."
         case .unableToLoadImage:
             return "Unable to load the source image."
         case .renderFailed:
             return "Failed to process the image."
-        case .pngEncodingFailed:
-            return "Failed to encode PNG output."
+        case .imageEncodingFailed, .pngEncodingFailed:
+            return "Failed to encode image output."
         }
     }
 }
@@ -61,8 +62,9 @@ enum ImagePipeline {
         }
 
         let typeIdentifier = typeRef as String
-        guard let type = UTType(typeIdentifier),
-              type.conforms(to: .png) || type.conforms(to: .webP) else {
+        let inferredType = UTType(typeIdentifier) ?? UTType(filenameExtension: url.pathExtension.lowercased())
+        guard let type = inferredType,
+              type.conforms(to: .png) || type.conforms(to: .webP) || type.conforms(to: .jpeg) else {
             throw PipelineError.unsupportedFormat
         }
 
@@ -1529,11 +1531,12 @@ enum ImagePipeline {
         try FileManager.default.copyItem(at: originalURL, to: backupURL)
 
         let directory = originalURL.deletingLastPathComponent()
-        let tempName = ".\(originalURL.lastPathComponent).tmp-\(UUID().uuidString).png"
+        let originalExtension = originalURL.pathExtension.isEmpty ? "png" : originalURL.pathExtension
+        let tempName = ".\(originalURL.lastPathComponent).tmp-\(UUID().uuidString).\(originalExtension)"
         let tempURL = directory.appendingPathComponent(tempName)
 
         do {
-            let data = try makePNGData(from: image, sourceProperties: sourceProperties)
+            let data = try makeImageData(for: originalURL, from: image, sourceProperties: sourceProperties)
             try data.write(to: tempURL, options: .atomic)
             do {
                 _ = try FileManager.default.replaceItemAt(
@@ -1555,18 +1558,19 @@ enum ImagePipeline {
         return backupURL
     }
 
-    private static func makeBackupURL(for originalURL: URL) -> URL {
+    static func makeBackupURL(for originalURL: URL) -> URL {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
         let stamp = formatter.string(from: Date())
 
+        let ext = originalURL.pathExtension.isEmpty ? "png" : originalURL.pathExtension
         let name = originalURL.deletingPathExtension().lastPathComponent
         let directory = originalURL.deletingLastPathComponent()
 
         for attempt in 0..<100 {
             let suffix = attempt == 0 ? "" : "-\(attempt)"
-            let backupFile = "\(name).backup-\(stamp)\(suffix).png"
+            let backupFile = "\(name).backup-\(stamp)\(suffix).\(ext)"
             let backupURL = directory.appendingPathComponent(backupFile)
 
             if !FileManager.default.fileExists(atPath: backupURL.path) {
@@ -1574,11 +1578,119 @@ enum ImagePipeline {
             }
         }
 
-        let fallback = "\(name).backup-\(stamp)-\(UUID().uuidString.prefix(8)).png"
+        let fallback = "\(name).backup-\(stamp)-\(UUID().uuidString.prefix(8)).\(ext)"
         return directory.appendingPathComponent(fallback)
     }
 
-    private static func makePNGData(from image: CGImage, sourceProperties: CFDictionary?) throws -> Data {
+    static func makeImageData(
+        for targetURL: URL,
+        from image: CGImage,
+        sourceProperties: CFDictionary?
+    ) throws -> Data {
+        let ext = targetURL.pathExtension.lowercased()
+        let inferredType = UTType(filenameExtension: ext)
+
+        if ext == "jpg" || ext == "jpeg" || inferredType?.conforms(to: .jpeg) == true {
+            return try makeJPEGData(from: image, sourceProperties: sourceProperties)
+        } else if ext == "webp" || inferredType?.conforms(to: .webP) == true {
+            if let webpData = try? makeWebPData(from: image, sourceProperties: sourceProperties) {
+                return webpData
+            }
+            return try makePNGData(from: image, sourceProperties: sourceProperties)
+        } else {
+            return try makePNGData(from: image, sourceProperties: sourceProperties)
+        }
+    }
+
+    static func makeJPEGData(
+        from image: CGImage,
+        sourceProperties: CFDictionary?,
+        compressionQuality: CGFloat = 0.92
+    ) throws -> Data {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw PipelineError.imageEncodingFailed
+        }
+
+        var outputProperties: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: compressionQuality
+        ]
+
+        if let source = sourceProperties as? [CFString: Any] {
+            if let dpiWidth = source[kCGImagePropertyDPIWidth] {
+                outputProperties[kCGImagePropertyDPIWidth] = dpiWidth
+            }
+            if let dpiHeight = source[kCGImagePropertyDPIHeight] {
+                outputProperties[kCGImagePropertyDPIHeight] = dpiHeight
+            }
+            if let jfifMeta = source[kCGImagePropertyJFIFDictionary] {
+                outputProperties[kCGImagePropertyJFIFDictionary] = jfifMeta
+            }
+            if let exifMeta = source[kCGImagePropertyExifDictionary] {
+                outputProperties[kCGImagePropertyExifDictionary] = exifMeta
+            }
+        }
+
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            outputProperties as CFDictionary
+        )
+
+        guard CGImageDestinationFinalize(destination) else {
+            throw PipelineError.imageEncodingFailed
+        }
+
+        return data as Data
+    }
+
+    static func makeWebPData(
+        from image: CGImage,
+        sourceProperties: CFDictionary?,
+        compressionQuality: CGFloat = 0.9
+    ) throws -> Data {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.webP.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw PipelineError.imageEncodingFailed
+        }
+
+        var outputProperties: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: compressionQuality
+        ]
+
+        if let source = sourceProperties as? [CFString: Any] {
+            if let dpiWidth = source[kCGImagePropertyDPIWidth] {
+                outputProperties[kCGImagePropertyDPIWidth] = dpiWidth
+            }
+            if let dpiHeight = source[kCGImagePropertyDPIHeight] {
+                outputProperties[kCGImagePropertyDPIHeight] = dpiHeight
+            }
+        }
+
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            outputProperties as CFDictionary
+        )
+
+        guard CGImageDestinationFinalize(destination) else {
+            throw PipelineError.imageEncodingFailed
+        }
+
+        return data as Data
+    }
+
+    static func makePNGData(from image: CGImage, sourceProperties: CFDictionary?) throws -> Data {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data,

@@ -4,12 +4,26 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate {
     var onOpenFile: ((URL) -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
         focusEditorWindows(ignoringOtherApps: true)
+
+        for delay in [0.04, 0.1, 0.2, 0.35, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.focusEditorWindows(ignoringOtherApps: true)
+            }
+        }
     }
 
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
         let url = URL(fileURLWithPath: filename)
         onOpenFile?(url)
+        focusEditorWindows(ignoringOtherApps: true)
+
+        for delay in [0.04, 0.1, 0.25] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.focusEditorWindows(ignoringOtherApps: true)
+            }
+        }
         return true
     }
 
@@ -22,7 +36,7 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func focusEditorWindows(ignoringOtherApps: Bool) {
+    func focusEditorWindows(ignoringOtherApps: Bool) {
         if ignoringOtherApps {
             NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
             NSApp.activate(ignoringOtherApps: true)
@@ -36,6 +50,8 @@ final class AppActivationDelegate: NSObject, NSApplicationDelegate {
             }
 
             window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
         }
     }
 }
+
